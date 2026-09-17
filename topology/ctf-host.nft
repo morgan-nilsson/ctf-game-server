@@ -1,0 +1,113 @@
+#!/usr/sbin/nft -f
+#
+# Policy for net.plane_mode = "host": one bridge per guest in the root
+# namespace, the host itself is the sole router and also runs the referee.
+#
+# That changes which hooks matter. In netns mode every referee packet is
+# forwarded through the router namespace; here it is *locally generated*, so
+# the referee->service direction lives in `output` and service->referee lives
+# in `input`. The asymmetry is the same, and it is still the whole RCE
+# containment argument:
+#
+#   output : the referee may dial any service
+#   input  : a service may only answer — established/related, never `new`
+#   forward: foothold <-> service only; a service forwarding anywhere else
+#            (peer, viewer, internet) drops
+#
+# NOTE ON `input`: this table is loaded in the ROOT namespace, where a
+# default-drop input chain would cut off the operator's own SSH. So `input`
+# has policy accept and drops narrowly by source instead. If you want a
+# default-drop host firewall, put it in a separate table at a lower priority
+# and add your admin rules there — do not change the policy here.
+
+table inet ctf {
+  counter ctf_drop { }
+  counter ctf_attack { }
+
+  set services  { type ipv4_addr; flags interval; elements = $svc_nets }
+  set footholds { type ipv4_addr; flags interval; elements = $foot_nets }
+
+  # --- conntrack bypass for attack traffic ------------------------------
+  # Blind ISN hijacking, forged-segment acceptance and UDP parser over-reads
+  # (RULES §7, the 75-point class) are by definition packets a state engine
+  # calls invalid: off-window, spoofed source, no matching flow. Track them
+  # and they never land, and that flag class quietly stops existing.
+  chain raw_prerouting {
+    type filter hook prerouting priority raw; policy accept;
+    # --- egress anti-spoof on the attack path -----------------------------
+    # rp_filter is off and the attack path is untracked, which is what makes
+    # blind injection possible at all — but that is a blunt instrument: as
+    # written, a foothold could claim to be ANY source, including the victim
+    # service itself, the host, or another plane. Anything that treats a
+    # source address as authorization is then forged for free, which is a
+    # different (and duller) game than guessing an ISN.
+    #
+    # So: permit exactly the spoofing the rules intend — the foothold's own
+    # address and the referee's, whose session is the legitimate target of a
+    # hijack — and drop every other claim.
+    iifname $foot_ifaces ip saddr != $spoof_ok limit rate 10/minute log prefix "ctf-spoof " level info
+    iifname $foot_ifaces ip saddr != $spoof_ok counter name "ctf_drop" drop
+
+    iifname $foot_ifaces ip daddr @services counter name "ctf_attack" notrack
+    iifname $svc_ifaces  ip daddr @footholds notrack
+  }
+
+  chain raw_output {
+    type filter hook output priority raw; policy accept;
+  }
+
+  # --- guest-to-guest and guest-to-elsewhere ----------------------------
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+
+    # the game: each foothold may reach any service, and the service may
+    # answer back down the same path. Untracked, so spoofed and off-window
+    # segments arrive exactly as sent.
+    iifname $foot_ifaces ip daddr @services accept
+    iifname $svc_ifaces  ip daddr @footholds accept
+
+    # Everything else drops. A service therefore cannot reach a peer service,
+    # the viewer plane, the LAN or the internet: an RCE'd service is boxed
+    # into replying in-band on its attacker's own connection.
+    limit rate 10/minute log prefix "ctf-drop-fwd " level info
+    counter name "ctf_drop" drop
+  }
+
+  # --- traffic terminating on the host (referee + viewer edge) ----------
+  chain input {
+    type filter hook input priority filter; policy accept;
+
+    # A service may answer the referee's probes and nothing more. No new
+    # connection from a service ever terminates on this host.
+    ip saddr @services ct state established,related accept
+    ip saddr @services counter name "ctf_drop" drop
+
+    # Footholds get the leaderboard and the submission API. Nothing else on
+    # the host is theirs to reach — not SSH, not ICMP, not the referee's
+    # internals. (No ICMP accept here on purpose: `networks.sh verify` pings
+    # the control address from each foothold and requires it to fail, and
+    # that check is only meaningful if the policy really does drop it.)
+    iifname $foot_ifaces tcp dport { $board_port, $submit_port } accept
+    iifname $foot_ifaces counter name "ctf_drop" drop
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+    # The referee dials services freely: deploy, probe, plant, retrieve.
+  }
+
+  # --- NAT --------------------------------------------------------------
+  chain nat_post {
+    type nat hook postrouting priority srcnat; policy accept;
+
+    # Deliberately empty. If the referee must pull player repos from the
+    # internet, masquerade ONLY its own egress interface — never a service
+    # plane, or you have just given a popped service a route out:
+    #
+    #   oifname "eth0" ip saddr $control_net masquerade
+    #
+    # The cleaner answer is to not let the referee out at all: have players
+    # push to a bare git remote on the host over the viewer/LAN edge, and
+    # let the watcher poll that local path instead.
+  }
+}

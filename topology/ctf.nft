@@ -1,0 +1,109 @@
+#!/usr/sbin/nft -f
+#
+# The whole game-plane policy. Loaded into the `ctf-gw` namespace by
+# networks.sh, which generates the definitions below it from the roster.
+#
+# Everything not listed here drops. The allow-list, in plain terms:
+#
+#   referee   -> every service          deploy, probe, plant, retrieve
+#   service   -> referee                REPLIES ONLY, never a new connection
+#   foothold  -> every other service    the attack path, deliberately untracked
+#   service   -> foothold               the response path, also untracked
+#   foothold  -> viewer edge            leaderboard + submission API, nothing else
+#   service   -> anything else          dropped: peers, viewer, internet, host
+#
+# Two asymmetries carry the whole security argument:
+#
+# 1. CONNTRACK, ON THE REFEREE PATH ONLY. The referee->service direction is
+#    tracked, so a service can answer the referee but can never dial it. That
+#    single rule is the RCE containment: own the service process and you are
+#    boxed into replying in-band on a connection someone else opened.
+#
+# 2. NOTRACK, ON THE ATTACK PATH. Blind ISN hijacking, forged-segment
+#    acceptance and UDP parser over-reads (RULES §7, the 75-point class) are
+#    *by definition* packets a state engine calls invalid: off-window, wrong
+#    source, no matching flow. Track them and they silently never land, and
+#    the transport-layer flag class quietly stops existing. So the attack
+#    path bypasses conntrack entirely.
+
+table inet ctf {
+  counter ctf_drop { }
+  counter ctf_attack { }
+
+  set services  { type ipv4_addr; flags interval; elements = $svc_nets }
+  set footholds { type ipv4_addr; flags interval; elements = $foot_nets }
+
+  # --- conntrack bypass for attack traffic ------------------------------
+  chain raw_prerouting {
+    type filter hook prerouting priority raw; policy accept;
+
+    # --- egress anti-spoof on the attack path -----------------------------
+    # rp_filter is off and the attack path is untracked, which is what makes
+    # blind injection possible at all — but that is a blunt instrument: as
+    # written, a foothold could claim to be ANY source, including the victim
+    # service itself, the host, or another plane. Anything that treats a
+    # source address as authorization is then forged for free, which is a
+    # different (and duller) game than guessing an ISN.
+    #
+    # So: permit exactly the spoofing the rules intend — the foothold's own
+    # address and the referee's, whose session is the legitimate target of a
+    # hijack — and drop every other claim.
+    iifname $foot_ifaces ip saddr != $spoof_ok limit rate 10/minute log prefix "ctf-spoof " level info
+    iifname $foot_ifaces ip saddr != $spoof_ok counter name "ctf_drop" drop
+
+    iifname $foot_ifaces ip daddr @services counter name "ctf_attack" notrack
+    iifname $svc_ifaces  ip daddr @footholds notrack
+  }
+
+  chain raw_output {
+    type filter hook output priority raw; policy accept;
+  }
+
+  # --- the policy --------------------------------------------------------
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+
+    # 1. referee -> services, tracked
+    iifname $ctrl_iface ip daddr @services accept
+    #    services -> referee: established replies only. No new connections.
+    oifname $ctrl_iface ip saddr @services ct state established,related accept
+
+    # 2. foothold -> service, and the service's answer back to its attacker.
+    #    Untracked (see the header), so spoofed and off-window segments
+    #    reach the target stack exactly as sent — which is the game.
+    iifname $foot_ifaces ip daddr @services accept
+    iifname $svc_ifaces  ip daddr @footholds accept
+
+    # 3. foothold -> viewer edge: submit a flag, read the board. Nothing else.
+    iifname $foot_ifaces ip daddr $viewer_net tcp dport { $board_port, $submit_port } accept
+    oifname $foot_ifaces ip saddr $viewer_net ct state established,related accept
+
+    # 4. everything else, and loudly enough to debug but not to flood
+    limit rate 10/minute log prefix "ctf-drop-fwd " level info
+    counter name "ctf_drop" drop
+  }
+
+  chain input {
+    type filter hook input priority filter; policy drop;
+    iifname "lo" accept
+    ct state established,related accept
+    # ICMP echo is useful for `networks.sh verify` and harmless.
+    icmp type echo-request limit rate 5/second accept
+    counter drop
+  }
+
+  chain output {
+    type filter hook output priority filter; policy accept;
+  }
+
+  chain nat_post {
+    type nat hook postrouting priority srcnat; policy accept;
+
+    # Deliberately empty. In netns mode the referee lives outside this
+    # namespace, so if it needs internet access to pull player repos that
+    # masquerade belongs on the HOST's egress interface — never here, and
+    # never on a service plane. The cleaner answer is to not let the referee
+    # out at all: have players push to a bare git remote on the host and let
+    # the watcher poll that local path.
+  }
+}

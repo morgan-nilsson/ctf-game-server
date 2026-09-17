@@ -1,0 +1,18 @@
+[Unit]
+Description=CTF network planes (control / game / viewer)
+After=network-online.target
+Before=ctf-tick.service ctf-submit.service ctf-leaderboard.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=CTF_CONFIG=/etc/ctf/ctf.toml
+WorkingDirectory=/opt/ctf
+ExecStart=/opt/ctf/topology/networks.sh up
+# "-" so a player who has not been deployed yet cannot fail the unit.
+ExecStartPost=-/opt/ctf/topology/vm.sh all-start
+ExecStop=/opt/ctf/topology/vm.sh all-stop
+ExecStop=/opt/ctf/topology/networks.sh down
+
+[Install]
+WantedBy=multi-user.target

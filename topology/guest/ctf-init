@@ -1,0 +1,132 @@
+#!/bin/sh
+# Guest PID 1 (SETUP §3) — the in-guest half of the fabric.
+#
+# The wiring problem this solves: packets for your service arrive on the
+# guest's virtio NIC (eth0, on a point-to-point /30 with the host router),
+# but your from-scratch stack lives on tun0 and answers 10.0.<n>.2. So the
+# guest kernel has to *route* eth0 -> tun0, and the reply has to route back.
+#
+#     foothold ──▶ host router ──▶ eth0 ──▶ [guest kernel routing] ──▶ tun0
+#                                                                       │
+#                                                        your stack reads it
+#                                                        and writes the reply
+#     foothold ◀── host router ◀── eth0 ◀── [guest kernel routing] ◀────┘
+#
+# The kernel holds tun0's .1 and treats your stack as a remote host *through*
+# tun0, so it never claims .2 itself and never emits the stray RSTs a raw
+# socket design has to fight.
+set -u
+
+log() { echo "[ctf-init] $*" > /dev/console 2>&1; }
+
+# Set a kernel tunable by writing /proc/sys directly. `sysctl` lives in
+# procps, which debootstrap --variant=minbase does NOT install, so calling it
+# here would silently do nothing — and the rp_filter settings below are
+# load-bearing (see the comment block further down).
+set_sysctl() {
+  _path="/proc/sys/$(echo "$1" | tr '.' '/')"
+  if [ -w "$_path" ]; then
+    echo "$2" > "$_path"
+  else
+    log "WARNING cannot set $1 (no $_path)"
+  fi
+}
+
+mount -t proc  proc  /proc      2>/dev/null
+mount -t sysfs sys   /sys       2>/dev/null
+mount -t devtmpfs dev /dev      2>/dev/null
+mount -t tmpfs tmp   /tmp       2>/dev/null
+mkdir -p /dev/pts /dev/net /srv/app
+mount -t devpts devpts /dev/pts 2>/dev/null
+[ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+
+log "mounting the deployed service"
+mount -o rw /dev/vdb /srv/app || { log "FATAL: no data disk on /dev/vdb"; exec /bin/sh; }
+if [ ! -f /srv/app/service.env ]; then
+  log "FATAL: /srv/app/service.env missing (deploy.py writes it)"
+  exec /bin/sh
+fi
+# shellcheck disable=SC1091
+. /srv/app/service.env
+export DOCROOT CTF_ADDR CTF_KERNEL_ADDR CTF_SUBNET CTF_TCP_PORT CTF_UDP_PORT
+
+log "player=$CTF_PLAYER addr=$CTF_ADDR subnet=$CTF_SUBNET mtu=$CTF_MTU"
+
+# --- sysctls, before any interface exists ---------------------------------
+# rp_filter bites HERE too, and this is the easier one to miss: a blind
+# spoofed segment arriving on eth0 has a source that does not route back out
+# eth0, so with rp_filter on, the guest kernel drops it before it ever
+# reaches tun0 — and the transport-layer flag class (RULES §7) silently stops
+# working. The kernel takes the MAX of conf.all and conf.<dev>, so `all`,
+# `default` and each device all have to be 0.
+set_sysctl net.ipv4.conf.all.rp_filter 0
+set_sysctl net.ipv4.conf.default.rp_filter 0
+set_sysctl net.ipv4.ip_forward 1                 # eth0 <-> tun0 is a routing hop
+set_sysctl net.ipv4.conf.all.accept_redirects 0
+set_sysctl net.ipv4.conf.all.send_redirects 0
+# No state engine in the guest either: an injected, off-window or spoofed
+# segment must reach the player's stack exactly as it was sent.
+command -v nft >/dev/null 2>&1 && nft flush ruleset 2>/dev/null
+command -v iptables >/dev/null 2>&1 && iptables -F 2>/dev/null
+
+ip link set lo up
+
+# --- eth0: the link to the host router ------------------------------------
+# Configured explicitly rather than trusting the kernel's ip= autoconf, so a
+# cmdline change cannot silently strand a guest.
+ip addr replace "${CTF_LINK_ADDR}" dev eth0 2>/dev/null
+ip link set eth0 mtu "$CTF_MTU" up
+ip route replace default via "${CTF_LINK_GW}" dev eth0 2>/dev/null
+set_sysctl net.ipv4.conf.eth0.rp_filter 0
+
+# RULES §5 parity — offload off, identically on every host, or L4 checksums
+# arrive unfilled and interop flakes in ways that look like your bug.
+ethtool -K eth0 tx off rx off tso off gso off gro off 2>/dev/null
+
+# --- tun0: your stack's L3 boundary ---------------------------------------
+# Persistent and owned by the unprivileged service user, so the player's
+# stack opens /dev/net/tun and attaches without ever needing root at runtime.
+ip tuntap add dev tun0 mode tun user app 2>/dev/null
+ip addr replace "${CTF_KERNEL_ADDR}/${CTF_SUBNET#*/}" dev tun0 2>/dev/null
+ip link set tun0 mtu "$CTF_MTU" up
+set_sysctl net.ipv4.conf.tun0.rp_filter 0
+ethtool -K tun0 tx off rx off 2>/dev/null        # else L4 checksums arrive unfilled
+
+log "eth0 ${CTF_LINK_ADDR} via ${CTF_LINK_GW}; tun0 kernel ${CTF_KERNEL_ADDR}, your stack answers ${CTF_ADDR}"
+ip -br addr  > /dev/console 2>&1
+ip route     > /dev/console 2>&1
+
+[ -x /usr/local/bin/isolation-selftest.sh ] && /usr/local/bin/isolation-selftest.sh
+
+chown -R app:app /srv/app 2>/dev/null
+cd /srv/app || exit 1
+
+CAPS=""
+for c in $(echo "${CTF_CAPS:-}" | tr ',' ' '); do
+  case "$c" in
+    NET_RAW)   CAPS="$CAPS,+net_raw" ;;
+    NET_ADMIN) CAPS="$CAPS,+net_admin" ;;
+  esac
+done
+CAPS=${CAPS#,}
+
+start_service() {
+  if [ -n "$CAPS" ]; then
+    exec setpriv --reuid app --regid app --init-groups \
+      --inh-caps "$CAPS" --ambient-caps "$CAPS" \
+      /bin/sh -c "exec $CTF_RUN"
+  else
+    exec setpriv --reuid app --regid app --init-groups /bin/sh -c "exec $CTF_RUN"
+  fi
+}
+
+# Supervise: a crash is a downed SLA, not a dead VM. The restart loop is
+# visible on the console, which is what `ctfctl console <player>` shows.
+backoff=1
+while true; do
+  log "starting service: $CTF_RUN (caps: ${CAPS:-none})"
+  ( start_service ) > /dev/console 2>&1
+  log "service exited rc=$?; restarting in ${backoff}s"
+  sleep "$backoff"
+  backoff=$(( backoff < 8 ? backoff * 2 : 8 ))
+done

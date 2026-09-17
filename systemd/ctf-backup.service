@@ -1,0 +1,10 @@
+[Unit]
+Description=CTF state backup
+
+[Service]
+Type=oneshot
+Environment=CTF_CONFIG=/etc/ctf/ctf.toml
+ExecStart=/opt/ctf/bin/ctfctl backup /var/backups/ctf
+User=ctf
+Group=ctf
+ReadWritePaths=/var/backups/ctf /srv/ctf

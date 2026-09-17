@@ -1,0 +1,23 @@
+[Unit]
+Description=CTF repo watcher (a push is a patch, RULES §8)
+After=network-online.target ctf-topology.service
+
+[Service]
+Type=exec
+Environment=CTF_CONFIG=/etc/ctf/ctf.toml
+WorkingDirectory=/opt/ctf
+ExecStart=/usr/bin/python3 -m orchestrator.watcher --interval 30
+Restart=always
+RestartSec=10
+# Deploy has to restart microVMs and write disk images, so this one keeps
+# root — it is the only orchestrator service that does.
+User=root
+ReadWritePaths=/srv/ctf /run/ctf /var/log/ctf
+NoNewPrivileges=no
+# Root is required to rebuild disk images and bounce microVMs. Keep at least
+# a private umask so anything it creates is not world-readable — the flag
+# store lives in these directories.
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

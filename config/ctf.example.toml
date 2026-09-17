@@ -1,0 +1,121 @@
+# /etc/ctf/ctf.toml  — central host configuration (orchestrator side).
+#
+# Scales to N players. Everything per-player except identity/repo/token is
+# derived from the player's index (see [net.alloc]); override per player only
+# if you need to.
+#
+# NOTE: transports / http_versions / ports are NOT configured here. They come
+# from each player's service.toml (SETUP §4) — the manifest is the only
+# interface between a repo and the orchestrator.
+
+[paths]
+root        = "/srv/ctf"
+players     = "/srv/ctf/players"      # working checkouts, one dir per player
+artifacts   = "/srv/ctf/artifacts"    # built artifacts + data disks
+repos       = "/srv/ctf/repos"        # bare mirrors the watcher polls
+state_db    = "/srv/ctf/state.db"     # single source of truth (sqlite, WAL)
+scoreboard  = "/srv/ctf/scoreboard.json"   # rendered view, read by leaderboard
+fixtures    = "/srv/ctf/fixtures"     # docroot fixtures planted at deploy
+run         = "/run/ctf"              # sockets, pidfiles, firecracker api
+logs        = "/var/log/ctf"
+
+[game]
+tick_seconds          = 60    # RULES §2  tick
+flag_lifetime_ticks   = 5     # RULES §2  K
+sla_grace_ticks       = 2     # RULES §8  post-redeploy immunity
+redeploy_min_interval = 90    # RULES §8  seconds, per service
+defense_bonus         = 0     # RULES §7 optional: +N/tick per unstolen protocol (0 = off)
+udp_flag_fixture      = false # RULES §3 transport-level flag surface on the UDP rung
+max_players           = 64    # guards the /8 allocations below
+# FULL fsyncs every commit: an accepted steal is durable the instant the
+# player is told it scored, even through a power cut. NORMAL is faster and
+# still process-crash safe, but can lose the last few commits on host loss.
+sqlite_synchronous    = "FULL"
+backup_keep           = 48    # hourly backups retained (48 = two days)
+
+[scoring.uptime]              # RULES §7 points per passing tick
+udp   = 2
+"0.9" = 1
+"1.0" = 1
+"1.1" = 3
+"2"   = 6
+"3"   = 10
+
+[scoring.attack]              # RULES §7 points per valid fresh steal
+app       = 50
+transport = 75
+rce       = 100
+
+[net]
+# viewer plane: humans only. Services on `game` have no route here.
+viewer_bind       = "10.9.0.1"
+viewer_cidr       = "10.9.0.0/24"
+leaderboard_port  = 8000
+submit_port       = 8001
+# control plane: probes and deploys originate here.
+control_bind      = "10.9.1.1"
+control_cidr      = "10.9.1.0/24"
+gw_control_addr   = "10.9.1.254"      # game router's leg on control
+
+# How the game plane is built:
+#   "netns" (default) — taps live in the `ctf-gw` router namespace and vm.sh
+#                       launches the hypervisor inside it. Fewest moving parts.
+#   "host"            — one bridge per guest in the ROOT namespace, host is the
+#                       sole router. Use this if libvirt manages your guests:
+#                       point each domain at <source bridge='br-svc<N>'/>.
+# Both give the same structural property: every guest is alone on its own L2
+# segment, so inter-guest traffic is routed (filtered natively by the forward
+# hook, no br_netfilter/ebtables) and nobody can sniff a peer's link.
+plane_mode = "netns"
+
+[net.alloc]
+# Player index i (1-based, order of the [[players]] blocks) gets:
+#   service subnet   10.<svc_octet>.<i>.0/24   kernel .1 (tun0), stack .2+
+#   VM link subnet   10.<link_octet>.<i>.0/30  gateway .1, guest eth0 .2
+#   foothold subnet  10.<foot_octet>.<i>.0/30  gateway .1, foothold ns .2
+svc_octet   = 0
+link_octet  = 10
+foot_octet  = 20
+mtu         = 1500          # RULES §5 parity — identical on every host
+
+[probe]
+timeout        = 4.0    # seconds per protocol operation
+connect_retry  = 1
+# HTTP/3 needs a QUIC client. The referee ships none (writing one is the
+# players' job, not the host's). Point this at an external prober that speaks
+# the JSON contract in docs/NOTE-API.md §5; empty = HTTP/3 is never scored.
+h3_probe_cmd   = ""
+
+[vm]
+hypervisor   = "firecracker"          # firecracker | qemu | qemu-tcg | libvirt | none
+kernel       = "/srv/ctf/vm/vmlinux"
+rootfs       = "/srv/ctf/vm/rootfs.ext4"   # read-only base, per-VM overlay on top
+vcpus        = 1
+mem_mib      = 512
+boot_timeout = 45
+
+# --- players -------------------------------------------------------------
+# Add or remove blocks freely; index = position in this list. Re-run
+# `ctfctl topology apply` after changing the roster.
+# `submit_token` authenticates the `by` field on the submission API so no
+# player can submit as another.
+
+[[players]]
+name         = "morgan"
+repo         = "https://github.com/morgan/ctf-stack.git"
+branch       = "main"
+submit_token = "CHANGE-ME-morgan"
+
+[[players]]
+name         = "friend"
+repo         = "https://github.com/friend/ctf-stack.git"
+branch       = "main"
+submit_token = "CHANGE-ME-friend"
+
+# [[players]]
+# name         = "third"
+# repo         = "git@github.com:third/ctf-stack.git"
+# branch       = "main"
+# submit_token = "CHANGE-ME-third"
+# # optional overrides:
+# # host = "10.0.3.2"; subnet = "10.0.3.0/24"; link = "10.10.3.2/30"

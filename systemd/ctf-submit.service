@@ -1,0 +1,48 @@
+[Unit]
+Description=CTF submission API (viewer edge only)
+After=network-online.target ctf-topology.service
+Requires=ctf-topology.service
+
+[Service]
+Type=exec
+Environment=CTF_CONFIG=/etc/ctf/ctf.toml
+WorkingDirectory=/opt/ctf
+ExecStart=/usr/bin/python3 -m orchestrator.submit
+Restart=always
+RestartSec=5
+User=ctf
+Group=ctf
+ReadWritePaths=/srv/ctf
+# RULES §9: this must be reachable from viewer, never from game.
+# The bind address is enforced in code; this is the second lock.
+IPAddressDeny=any
+IPAddressAllow=10.9.0.0/24
+IPAddressAllow=10.20.0.0/16
+IPAddressAllow=localhost
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+# --- hardening: this process parses hostile input ------------------------
+# The prober is the one channel that must stay open into a player-controlled
+# service, so treat it as attack surface rather than trusted infrastructure.
+UMask=0077
+MemoryMax=512M
+MemorySwapMax=0
+TasksMax=128
+NoNewPrivileges=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

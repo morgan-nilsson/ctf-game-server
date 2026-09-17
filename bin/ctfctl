@@ -1,0 +1,634 @@
+#!/usr/bin/env python3
+"""ctfctl — run and maintain the CTF host.
+
+  ctfctl status                    everything at a glance
+  ctfctl preflight                 can this host run the game?
+  ctfctl selftest                  does the referee actually work here?
+  ctfctl topology up|down|verify   network planes
+  ctfctl vm start|stop|console ... service microVMs
+  ctfctl deploy <player> [--force] build + deploy now (RULES §8 rate limit)
+  ctfctl validate <service.toml>   manifest check
+  ctfctl board | recount           scoreboard
+  ctfctl submissions | review      steal ledger and class spot-checks
+  ctfctl freeze | unfreeze         pause/resume scoring
+  ctfctl foothold <player>         shell on that player's attack vantage
+  ctfctl backup | restore | verify state management
+  ctfctl reset                     start a fresh round
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from orchestrator.config import load as load_config          # noqa: E402
+from orchestrator.deploy import DeployError, deploy          # noqa: E402
+from orchestrator.state import Store                         # noqa: E402
+from orchestrator.validate import ManifestError, load as load_manifest  # noqa: E402
+
+G, Y, R, D, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
+
+
+def sh(cmd: list[str], check: bool = False) -> int:
+    if os.geteuid() != 0 and cmd[0] != "sudo" and _needs_root(cmd):
+        cmd = ["sudo", *cmd]
+    return subprocess.run(cmd, check=check).returncode
+
+
+def _needs_root(cmd: list[str]) -> bool:
+    return any(part.endswith(("networks.sh", "vm.sh")) or part == "ip" for part in cmd[:1])
+
+
+def when(ts: float | None) -> str:
+    if not ts:
+        return "never"
+    delta = time.time() - ts
+    if delta < 90:
+        return f"{int(delta)}s ago"
+    if delta < 5400:
+        return f"{int(delta // 60)}m ago"
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%MZ")
+
+
+def open_store(args):
+    cfg = load_config(args.config)
+    store = Store(cfg.path_of("state_db"),
+                  cfg.p("game", "sqlite_synchronous", default="FULL"))
+    store.sync_roster(cfg.players)
+    return cfg, store
+
+
+# --------------------------------------------------------------------------
+def cmd_status(args) -> int:
+    cfg, store = open_store(args)
+    tick = store.tick
+    frozen = store.frozen
+    print(f"tick {tick}" + (f"  {Y}SCORING FROZEN{X}" if frozen else "")
+          + f"   ({len(cfg.players)} players, {cfg.tick_seconds}s ticks, K={cfg.K})")
+    started = store.get_meta("tick_started")
+    if started:
+        print(f"{D}last tick started {when(float(started))}{X}")
+    print()
+
+    totals = store.totals()
+    board_path = cfg.path_of("scoreboard")
+    board = json.loads(board_path.read_text()) if board_path.exists() else {"players": {}}
+
+    header = f"{'player':<14}{'total':>7}{'atk':>6}{'up':>6}{'caps':>6}{'lost':>6}  {'vm':<10}{'rev':<10}protocols"
+    print(header)
+    print("-" * max(len(header), 78))
+    for row in store.db.execute("SELECT * FROM players ORDER BY idx"):
+        name = row["name"]
+        acc = totals.get(name, {})
+        grid = board.get("players", {}).get(name, {}).get("up", {})
+        cells = []
+        for proto, state in grid.items():
+            colour = Y if state == "grace" else (G if state else R)
+            mark = "~" if state == "grace" else ("+" if state else "-")
+            cells.append(f"{colour}{mark}{proto}{X}")
+        vm = row["status"] or "unknown"
+        vm_c = G if vm == "running" else (R if vm == "failed" else Y)
+        print(f"{name:<14}{acc.get('total',0):>7}{acc.get('attack',0):>6}"
+              f"{acc.get('uptime',0):>6}{acc.get('captured',0):>6}{acc.get('stolen_from',0):>6}  "
+              f"{vm_c}{vm:<10}{X}{(row['rev'] or '')[:8]:<10}{' '.join(cells) or D + 'none' + X}")
+
+    pending = store.db.execute(
+        "SELECT COUNT(*) n FROM submissions WHERE pending=1").fetchone()["n"]
+    if pending:
+        print(f"\n{Y}{pending} submission(s) awaiting class review — ctfctl review{X}")
+
+    live = store.db.execute("SELECT COUNT(*) n FROM flags").fetchone()["n"]
+    print(f"\n{D}{live} live flags · state {cfg.path_of('state_db')}{X}")
+    store.close()
+    return 0
+
+
+def cmd_board(args) -> int:
+    cfg, store = open_store(args)
+    print(json.dumps(store.render_board(store.tick, cfg.path_of("scoreboard")), indent=2))
+    store.close()
+    return 0
+
+
+def cmd_recount(args) -> int:
+    cfg, store = open_store(args)
+    board = store.render_board(store.tick, cfg.path_of("scoreboard"))
+    print(f"recounted from the ledger: {len(board['players'])} players at tick {board['tick']}")
+    store.close()
+    return 0
+
+
+def cmd_players(args) -> int:
+    cfg, _ = load_config(args.config), None
+    print(f"{'#':<3}{'player':<14}{'service':<14}{'foothold ns':<20}{'subnet':<16}repo")
+    for p in cfg.players:
+        print(f"{p.index:<3}{p.name:<14}{p.host:<14}{p.netns:<20}{p.subnet:<16}{p.repo}")
+    return 0
+
+
+def cmd_deploy(args) -> int:
+    cfg, store = open_store(args)
+    targets = cfg.players if args.player == "all" else [cfg.player(args.player)]
+    if any(t is None for t in targets):
+        print(f"no such player: {args.player}", file=sys.stderr)
+        return 2
+    rc = 0
+    for player in targets:
+        try:
+            rev = deploy(cfg, store, player, args.rev, args.force)
+            print(f"{G}deployed{X} {player.name} at {rev[:12]}")
+        except DeployError as exc:
+            print(f"{R}FAILED{X} {player.name}: {exc}", file=sys.stderr)
+            rc = 1
+    store.close()
+    return rc
+
+
+def cmd_validate(args) -> int:
+    try:
+        m = load_manifest(args.path)
+    except (ManifestError, OSError) as exc:
+        print(f"{R}INVALID{X}: {exc}", file=sys.stderr)
+        return 1
+    print(f"{G}OK{X} {m['name']}: transports={m['transports']} http={m['http_versions']} "
+          f"tcp={m['tcp_port']} udp={m['udp_port']} caps={m['caps']}")
+    return 0
+
+
+def cmd_topology(args) -> int:
+    return sh([str(ROOT / "topology" / "networks.sh"), args.action])
+
+
+def cmd_vm(args) -> int:
+    cmd = [str(ROOT / "topology" / "vm.sh"), args.action]
+    if args.player:
+        cmd.append(args.player)
+    return sh(cmd)
+
+
+def cmd_console(args) -> int:
+    return sh([str(ROOT / "topology" / "vm.sh"), "console", args.player, str(args.lines)])
+
+
+def cmd_foothold(args) -> int:
+    cfg = load_config(args.config)
+    player = cfg.player(args.player)
+    if player is None:
+        print(f"no such player: {args.player}", file=sys.stderr)
+        return 2
+    peers = ", ".join(f"{p.name}={p.host}" for p in cfg.players if p.name != player.name)
+    print(f"{D}foothold for {player.name} ({player.foot_addr}). Peers: {peers}{X}")
+    print(f"{D}You may send anything toward a peer; you may not sniff their link (RULES §5).{X}")
+    cmd = ["ip", "netns", "exec", player.netns, *(args.cmd or [os.environ.get("SHELL", "/bin/bash")])]
+    return sh(cmd)
+
+
+def cmd_submissions(args) -> int:
+    _, store = open_store(args)
+    where = "WHERE pending=1" if args.pending else ""
+    rows = store.db.execute(
+        f"SELECT * FROM submissions {where} ORDER BY id DESC LIMIT ?", (args.limit,)
+    ).fetchall()
+    if not rows:
+        print("no submissions")
+        return 0
+    print(f"{'id':<6}{'when':<14}{'by':<12}{'owner':<12}{'proto':<7}{'verdict':<20}{'pts':>5}  class")
+    for r in rows:
+        klass = r["klass"] or "-"
+        if r["pending"]:
+            klass += f" {Y}(claims {r['claimed']}){X}"
+        colour = G if r["verdict"] == "accepted" else D
+        print(f"{r['id']:<6}{when(r['ts']):<14}{r['by']:<12}{(r['owner'] or '-'):<12}"
+              f"{(r['protocol'] or '-'):<7}{colour}{r['verdict']:<20}{X}{r['points']:>5}  {klass}")
+    store.close()
+    return 0
+
+
+def cmd_review(args) -> int:
+    """RULES §7 / SETUP §7 — spot-check a claimed exploit class."""
+    cfg, store = open_store(args)
+    row = store.db.execute("SELECT * FROM submissions WHERE id=?", (args.id,)).fetchone()
+    if row is None:
+        print(f"no submission #{args.id}", file=sys.stderr)
+        return 2
+    if not row["pending"]:
+        print(f"submission #{args.id} has nothing pending (class {row['klass']}, {row['points']} pts)")
+        return 0
+    print(f"#{row['id']} {row['by']} stole {row['owner']}/{row['protocol']}")
+    print(f"  paid {row['points']} as {row['klass']}, claims {row['claimed']}")
+    print(f"  write-up:\n{(row['writeup'] or '(none)')[:2000]}")
+    if args.action == "show":
+        return 0
+    if args.action == "approve":
+        points = cfg.attack_points.get(row["claimed"], row["points"])
+        store.db.execute(
+            "UPDATE submissions SET klass=?, points=?, pending=0 WHERE id=?",
+            (row["claimed"], points, row["id"]),
+        )
+        store.event("review-approved", row["by"], f"#{row['id']} -> {row['claimed']} ({points})")
+        print(f"{G}approved{X}: now {points} points as {row['claimed']}")
+    else:
+        store.db.execute("UPDATE submissions SET pending=0 WHERE id=?", (row["id"],))
+        store.event("review-rejected", row["by"], f"#{row['id']} stays {row['klass']}")
+        print(f"{Y}rejected{X}: stays {row['points']} points as {row['klass']}")
+    store.render_board(store.tick, cfg.path_of("scoreboard"))
+    store.close()
+    return 0
+
+
+def cmd_flags(args) -> int:
+    """Operator view of live flags. Tokens stay hidden unless you insist."""
+    _, store = open_store(args)
+    rows = store.db.execute(
+        "SELECT * FROM flags ORDER BY tick DESC, player LIMIT ?", (args.limit,)
+    ).fetchall()
+    print(f"{'player':<12}{'proto':<7}{'tick':>6}{'expires':>8}  {'stolen by':<12}flag")
+    for r in rows:
+        token = r["flag"] if args.show_tokens else r["flag"][:9] + "…"
+        print(f"{r['player']:<12}{r['protocol']:<7}{r['tick']:>6}{r['expires_tick']:>8}  "
+              f"{(r['stolen_by'] or '-'):<12}{token}")
+    if not args.show_tokens:
+        print(f"\n{D}tokens elided; --show-tokens prints them (never do this on a shared screen){X}")
+    store.close()
+    return 0
+
+
+def cmd_freeze(args) -> int:
+    cfg, store = open_store(args)
+    store.set_meta("frozen", "1" if args.on else "0")
+    store.event("freeze" if args.on else "unfreeze", "", "")
+    store.render_board(store.tick, cfg.path_of("scoreboard"))
+    print(f"scoring {'frozen' if args.on else 'resumed'} at tick {store.tick}")
+    store.close()
+    return 0
+
+
+def cmd_backup(args) -> int:
+    cfg, store = open_store(args)
+    root = Path(args.dest)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = root / f"ctf-backup-{stamp}"
+    n = 0
+    while dest.exists():            # two backups in the same second
+        n += 1
+        dest = root / f"ctf-backup-{stamp}.{n}"
+    dest.mkdir(parents=True)
+    store.backup_to(dest / "state.db")          # online API + integrity check
+    for name in ("scoreboard", "fixtures"):
+        src = cfg.path_of(name)
+        if src.exists():
+            (shutil.copytree if src.is_dir() else shutil.copy2)(src, dest / src.name)
+    shutil.copy2(cfg.path, dest / "ctf.toml")
+    ok, detail = Store.verify(dest / "state.db")
+    print(f"backup written to {dest}\n  verified: {ok} ({detail})")
+
+    keep = args.keep if args.keep is not None else int(cfg.p("game", "backup_keep", default=48))
+    if keep > 0:
+        old = sorted(d for d in root.glob("ctf-backup-*") if d.is_dir())[:-keep]
+        for stale in old:
+            shutil.rmtree(stale, ignore_errors=True)
+        if old:
+            print(f"  pruned {len(old)} backup(s) older than the last {keep}")
+    store.close()
+    return 0 if ok else 1
+
+
+def _referee_running() -> list[str]:
+    """Which referee services are live? Restoring under a running tick loop
+    would have it write over what we just restored."""
+    live = []
+    for unit in ("ctf-tick", "ctf-submit", "ctf-watcher"):
+        try:
+            res = subprocess.run(["systemctl", "is-active", "--quiet", unit], timeout=5)
+            if res.returncode == 0:
+                live.append(unit)
+        except (OSError, subprocess.SubprocessError):
+            pass                        # no systemd here: fall through to the flag
+    return live
+
+
+def cmd_restore(args) -> int:
+    """Put a backup back. Verifies first, snapshots what it replaces, and
+    recounts, so a restore can itself be undone."""
+    cfg = load_config(args.config)
+    src = Path(args.source)
+    if src.is_dir():
+        src = src / "state.db"
+    if not src.exists():
+        print(f"no such backup: {src}", file=sys.stderr)
+        return 2
+
+    ok, detail = Store.verify(src)
+    print(f"{src}\n  integrity: {'ok' if ok else 'FAILED'} ({detail})")
+    if not ok:
+        print("refusing to restore a database that fails its integrity check", file=sys.stderr)
+        return 1
+
+    live = _referee_running()
+    if live and not args.force:
+        print(f"\n{R}refusing:{X} these are still running: {', '.join(live)}")
+        print("  stop them first:  systemctl stop " + " ".join(live))
+        print("  then:             ctfctl restore " + str(args.source))
+        return 1
+
+    target = cfg.path_of("state_db")
+    if not args.confirm:
+        cur = "(none)"
+        if target.exists():
+            cur_ok, cur_detail = Store.verify(target)
+            cur = f"{cur_detail}" if cur_ok else f"unreadable: {cur_detail}"
+        print(f"\nwould replace {target}\n  current: {cur}\n  backup : {detail}")
+        print("\nre-run with --confirm")
+        return 1
+
+    # Snapshot whatever we are about to overwrite, so this is reversible.
+    if target.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        aside = target.with_name(f"{target.name}.replaced-{stamp}")
+        for suffix in ("", "-wal", "-shm"):
+            part = Path(str(target) + suffix)
+            if part.exists():
+                shutil.copy2(part, str(aside) + suffix)
+        os.chmod(aside, 0o600)
+        print(f"  previous state kept at {aside}")
+        for suffix in ("-wal", "-shm"):     # stale WAL would resurrect old rows
+            Path(str(target) + suffix).unlink(missing_ok=True)
+
+    shutil.copy2(src, target)
+    os.chmod(target, 0o600)
+
+    store = Store(target, cfg.p("game", "sqlite_synchronous", default="FULL"))
+    store.sync_roster(cfg.players)
+    board = store.render_board(store.tick, cfg.path_of("scoreboard"))
+    totals = {n: p["total"] for n, p in board["players"].items()}
+    print(f"\n{G}restored{X} at tick {board['tick']}: {totals}")
+    store.event("restore", "", f"from {src}")
+    store.close()
+    print("start the referee again: systemctl start ctf-tick ctf-submit ctf-watcher")
+    return 0
+
+
+def cmd_verify(args) -> int:
+    cfg = load_config(args.config)
+    target = Path(args.path) if args.path else cfg.path_of("state_db")
+    if target.is_dir():
+        target = target / "state.db"
+    ok, detail = Store.verify(target)
+    print(f"{target}: {(G + 'ok' + X) if ok else (R + 'FAILED' + X)} ({detail})")
+    return 0 if ok else 1
+
+
+def cmd_reset(args) -> int:
+    """Start a fresh round: wipe flags, uptime and steals; keep the roster."""
+    cfg, store = open_store(args)
+    if not args.confirm:
+        counts = {t: store.db.execute(f"SELECT COUNT(*) n FROM {t}").fetchone()["n"]
+                  for t in ("flags", "uptime", "submissions", "deploys")}
+        print("this would delete: " + ", ".join(f"{v} {k}" for k, v in counts.items()))
+        print("re-run with --confirm (take a backup first: ctfctl backup)")
+        return 1
+    for table in ("flags", "uptime", "submissions"):
+        store.db.execute(f"DELETE FROM {table}")
+    store.set_meta("tick", 0)
+    store.set_meta("frozen", "0")
+    store.db.execute("UPDATE players SET grace_until_tick=0")
+    store.event("reset", "", "new round")
+    store.render_board(0, cfg.path_of("scoreboard"))
+    print("round reset; tick counter back to 0")
+    store.close()
+    return 0
+
+
+def cmd_token(args) -> int:
+    cfg = load_config(args.config)
+    player = cfg.player(args.player)
+    if player is None:
+        print(f"no such player: {args.player}", file=sys.stderr)
+        return 2
+    port = cfg.p("net", "submit_port", default=8001)
+    host = cfg.p("net", "viewer_bind", default="10.9.0.1")
+    print(f"""submit token for {player.name}: {player.submit_token}
+
+  curl -s http://{host}:{port}/submit -H 'Content-Type: application/json' \\
+    -d '{{"by":"{player.name}","token":"{player.submit_token}","flag":"FLAG_..."}}'
+""")
+    return 0
+
+
+def cmd_logs(args) -> int:
+    unit = {"tick": "ctf-tick", "submit": "ctf-submit",
+            "board": "ctf-leaderboard", "watcher": "ctf-watcher"}.get(args.unit, args.unit)
+    return sh(["journalctl", "-u", unit, "-n", str(args.lines), *(["-f"] if args.follow else [])])
+
+
+def cmd_selftest(args) -> int:
+    """Prove the referee works on THIS host, without VMs or players.
+
+    Starts the bundled reference service on loopback and drives the real
+    prober, the real flag contract and the real scoring path against it. If
+    this passes, anything still broken at game time is a player's stack or
+    the network planes — not the referee.
+    """
+    import socket
+    import tempfile
+
+    cfg = load_config(args.config)
+    failures = []
+
+    def check(label, ok, detail=""):
+        print(f"  {(G + 'ok  ' + X) if ok else (R + 'FAIL' + X)} {label}"
+              + (f"  — {detail}" if detail and not ok else ""))
+        if not ok:
+            failures.append(label)
+
+    print("== config ==")
+    check(f"{cfg.path} parses, {len(cfg.players)} players: {', '.join(cfg.names)}", True)
+    bad_tokens = [p.name for p in cfg.players
+                  if not p.submit_token or p.submit_token.startswith("CHANGE-ME")]
+    check("every player has a real submit token", not bad_tokens, f"placeholders: {bad_tokens}")
+    dupes = len({p.submit_token for p in cfg.players}) != len(cfg.players)
+    check("submit tokens are distinct", not dupes)
+    check("no two players share a service address",
+          len({p.host for p in cfg.players}) == len(cfg.players))
+
+    print("\n== state ==")
+    try:
+        store = Store(cfg.path_of("state_db"), cfg.p("game", "sqlite_synchronous", default="FULL"))
+        store.sync_roster(cfg.players)
+        ok, detail = Store.verify(cfg.path_of("state_db"))
+        check(f"flag store writable and healthy ({detail})", ok, detail)
+        mode = oct(os.stat(cfg.path_of("state_db")).st_mode & 0o777)
+        check(f"flag store is owner-only ({mode})",
+              not (os.stat(cfg.path_of("state_db")).st_mode & 0o077))
+        with tempfile.TemporaryDirectory() as td:
+            store.backup_to(Path(td) / "t.db")
+            check("backup path works", True)
+        store.close()
+    except Exception as exc:
+        check("flag store", False, str(exc))
+
+    print("\n== the prober, against the bundled reference service ==")
+    sock = socket.socket(); sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]; sock.close()
+    proc = subprocess.Popen(
+        [sys.executable, str(ROOT / "tests" / "fake_service.py"),
+         "--tcp", str(port), "--udp", str(port)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(1.2)
+        from orchestrator.probes import (ProbeFailure, fetch_note, plant_note,
+                                         probe_http, probe_udp)
+        timeout = cfg.probe_timeout
+        for version in ("0.9", "1.0", "1.1", "2"):
+            try:
+                probe_http("127.0.0.1", port, version, "/health", timeout)
+                check(f"HTTP/{version} probe", True)
+            except ProbeFailure as exc:
+                check(f"HTTP/{version} probe", False, str(exc))
+        try:
+            probe_udp("127.0.0.1", port, timeout)
+            check("UDP echo probe", True)
+        except ProbeFailure as exc:
+            check("UDP echo probe", False, str(exc))
+
+        flag = Store.new_flag()
+        try:
+            ref = plant_note("127.0.0.1", port, "1.1", flag, timeout)
+            got = fetch_note("127.0.0.1", port, "1.1", ref, timeout)
+            check("flag plant + retrieve round-trip (the SLA check)", got == flag,
+                  f"planted {flag[:12]}…, got {got[:12]}…")
+        except ProbeFailure as exc:
+            check("flag plant + retrieve round-trip (the SLA check)", False, str(exc))
+    finally:
+        proc.terminate()
+
+    print("\n== hostile-input containment ==")
+    for mode in ("clen", "manychunks"):
+        hp = subprocess.Popen([sys.executable, str(ROOT / "tests" / "hostile_service.py"), mode],
+                              stdout=subprocess.PIPE, text=True)
+        try:
+            hport = int(hp.stdout.readline())
+            from orchestrator.probes import ProbeFailure, probe_http
+            t0 = time.time()
+            try:
+                probe_http("127.0.0.1", hport, "1.1", "/health", cfg.probe_timeout)
+                check(f"hostile/{mode} rejected", False, "the prober accepted it")
+            except ProbeFailure:
+                check(f"hostile/{mode} rejected in {time.time() - t0:.1f}s", True)
+        finally:
+            hp.kill()
+
+    print("\n== planes ==")
+    if os.geteuid() == 0:
+        rc = subprocess.run([str(ROOT / "topology" / "networks.sh"), "status"],
+                            capture_output=True, text=True).returncode
+        check("topology responds to `status`", rc == 0)
+        print(f"  {D}run `ctfctl topology verify` for the full isolation check{X}")
+    else:
+        print(f"  {D}skipped (needs root): sudo ctfctl selftest{X}")
+
+    print()
+    if failures:
+        print(f"{R}{len(failures)} problem(s):{X} " + "; ".join(failures))
+        return 1
+    print(f"{G}selftest passed{X} — the referee works on this host.")
+    return 0
+
+
+def cmd_preflight(args) -> int:
+    return subprocess.run([str(ROOT / "bin" / "preflight.sh")]).returncode
+
+
+# --------------------------------------------------------------------------
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="ctfctl", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-c", "--config", default=None)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    sub.add_parser("board").set_defaults(fn=cmd_board)
+    sub.add_parser("recount").set_defaults(fn=cmd_recount)
+    sub.add_parser("players").set_defaults(fn=cmd_players)
+    sub.add_parser("preflight").set_defaults(fn=cmd_preflight)
+    sub.add_parser("selftest").set_defaults(fn=cmd_selftest)
+
+    p = sub.add_parser("deploy"); p.set_defaults(fn=cmd_deploy)
+    p.add_argument("player", help="player name, or 'all'")
+    p.add_argument("--rev"); p.add_argument("--force", action="store_true")
+
+    p = sub.add_parser("validate"); p.set_defaults(fn=cmd_validate)
+    p.add_argument("path")
+
+    p = sub.add_parser("topology"); p.set_defaults(fn=cmd_topology)
+    p.add_argument("action", choices=["up", "down", "status", "verify", "apply"])
+
+    p = sub.add_parser("vm"); p.set_defaults(fn=cmd_vm)
+    p.add_argument("action", choices=["start", "stop", "restart", "status", "all-start", "all-stop"])
+    p.add_argument("player", nargs="?")
+
+    p = sub.add_parser("console"); p.set_defaults(fn=cmd_console)
+    p.add_argument("player"); p.add_argument("-n", "--lines", type=int, default=60)
+
+    p = sub.add_parser("foothold"); p.set_defaults(fn=cmd_foothold)
+    p.add_argument("player"); p.add_argument("cmd", nargs="*")
+
+    p = sub.add_parser("submissions"); p.set_defaults(fn=cmd_submissions)
+    p.add_argument("--pending", action="store_true"); p.add_argument("-n", "--limit", type=int, default=30)
+
+    p = sub.add_parser("review"); p.set_defaults(fn=cmd_review)
+    p.add_argument("id", type=int)
+    p.add_argument("action", nargs="?", choices=["show", "approve", "reject"], default="show")
+
+    p = sub.add_parser("flags"); p.set_defaults(fn=cmd_flags)
+    p.add_argument("-n", "--limit", type=int, default=40)
+    p.add_argument("--show-tokens", action="store_true")
+
+    sub.add_parser("freeze").set_defaults(fn=cmd_freeze, on=True)
+    sub.add_parser("unfreeze").set_defaults(fn=cmd_freeze, on=False)
+
+    p = sub.add_parser("backup"); p.set_defaults(fn=cmd_backup)
+    p.add_argument("dest", nargs="?", default="/var/backups/ctf")
+    p.add_argument("--keep", type=int, default=None,
+                   help="how many backups to retain (default: game.backup_keep)")
+
+    p = sub.add_parser("restore"); p.set_defaults(fn=cmd_restore)
+    p.add_argument("source", help="a backup directory, or a state.db inside one")
+    p.add_argument("--confirm", action="store_true")
+    p.add_argument("--force", action="store_true",
+                   help="restore even while referee services are running")
+
+    p = sub.add_parser("verify"); p.set_defaults(fn=cmd_verify)
+    p.add_argument("path", nargs="?", help="default: the live state database")
+
+    p = sub.add_parser("reset"); p.set_defaults(fn=cmd_reset)
+    p.add_argument("--confirm", action="store_true")
+
+    p = sub.add_parser("token"); p.set_defaults(fn=cmd_token)
+    p.add_argument("player")
+
+    p = sub.add_parser("logs"); p.set_defaults(fn=cmd_logs)
+    p.add_argument("unit", choices=["tick", "submit", "board", "watcher"])
+    p.add_argument("-n", "--lines", type=int, default=80)
+    p.add_argument("-f", "--follow", action="store_true")
+
+    args = ap.parse_args(argv)
+    if getattr(args, "cmd", None) == "topology" and args.action == "apply":
+        args.action = "up"
+    try:
+        return args.fn(args)
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,20 @@
+# Template player manifest (SETUP §4). Copy this into your own repo.
+# Validate before pushing:  ctfctl validate service.toml
+
+[service]
+name = "example"                 # must match your name in the host roster
+
+# Transport menu — declare any subset. quic REQUIRES udp.
+# You score and are attackable ONLY on declared transports (RULES §3).
+transports    = ["tcp"]
+
+# HTTP version menu — 0.9/1.0/1.1/2 require tcp; 3 requires quic.
+http_versions = ["1.0", "1.1"]
+
+build    = "./build.sh"          # runs offline, sandboxed, no flags, no secrets
+run      = "./run.sh"            # starts your stack in the guest
+tcp_port = 8080
+udp_port = 8080
+docroot  = "$DOCROOT"            # orchestrator plants fixtures here
+caps     = ["NET_RAW", "NET_ADMIN"]
+health   = "GET /health"
