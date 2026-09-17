@@ -108,6 +108,26 @@ def cmd_status(args) -> int:
 
     live = store.db.execute("SELECT COUNT(*) n FROM flags").fetchone()["n"]
     print(f"\n{D}{live} live flags · state {cfg.path_of('state_db')}{X}")
+
+    # What should be running, and is it?
+    units = [("ctf-topology", "network planes + microVMs"),
+             ("ctf-tick", "scoring loop"),
+             ("ctf-submit", "submission API"),
+             ("ctf-leaderboard", "leaderboard page"),
+             ("ctf-watcher", "push = redeploy")]
+    states = []
+    for unit, what in units:
+        try:
+            res = subprocess.run(["systemctl", "is-active", unit],
+                                 capture_output=True, text=True, timeout=5)
+            state = res.stdout.strip() or "unknown"
+        except (OSError, subprocess.SubprocessError):
+            state = "n/a"
+        colour = G if state == "active" else (D if state == "n/a" else R)
+        states.append(f"{colour}{unit}={state}{X}")
+    print("services: " + "  ".join(states))
+    if any("=inactive" in s or "=failed" in s for s in states):
+        print(f"{Y}  something is down — systemctl start <unit>, or: ctfctl logs tick{X}")
     store.close()
     return 0
 

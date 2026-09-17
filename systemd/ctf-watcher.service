@@ -1,6 +1,7 @@
 [Unit]
 Description=CTF repo watcher (a push is a patch, RULES §8)
 After=network-online.target ctf-topology.service
+Requires=ctf-topology.service
 
 [Service]
 Type=exec

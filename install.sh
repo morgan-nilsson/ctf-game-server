@@ -83,7 +83,10 @@ cat > /etc/tmpfiles.d/ctf.conf <<'EOF'
 d /run/ctf 0750 ctf ctf -
 EOF
 systemctl daemon-reload
-systemctl enable ctf-backup.timer >/dev/null
+# Enable (not start) everything, so a reboot mid-game brings the whole game
+# back by itself: planes, microVMs, scoring, board, submissions, watcher.
+systemctl enable ctf-topology.service ctf-tick.service ctf-leaderboard.service \
+                 ctf-submit.service ctf-watcher.service ctf-backup.timer >/dev/null 2>&1
 
 echo
 echo "installed to $PREFIX"

@@ -52,6 +52,82 @@ ctfctl status
 
 Open the leaderboard on the viewer address (default `http://10.9.0.1:8000/`).
 
+### Dry run, before anyone depends on it
+
+Prove the scoring loop end to end on your own box, playing both sides. You
+are the referee, so you can read a live flag — that is exactly what an
+attacker has to steal:
+
+```bash
+sudo ctfctl topology verify         # GATE: read the negative results
+ctfctl status                       # are the declared rungs green?
+
+ctfctl flags --show-tokens          # take one flag owned by player A
+curl -s http://10.9.0.1:8001/submit -H 'Content-Type: application/json' \
+  -d '{"by":"B","token":"<B token>","flag":"FLAG_..."}'
+# expect: {"verdict":"+50",...}
+
+ctfctl submissions                  # the steal is in the ledger
+ctfctl status                       # B's attack column moved
+```
+
+Then prove the patch mechanic: push a trivial commit to a player repo and
+watch the watcher pick it up within ~30 s —
+
+```bash
+ctfctl logs watcher -f              # "deployed <rev>"
+ctfctl status                       # new rev, and `~` grace on the grid
+```
+
+**Then wipe the practice scores before the real start:**
+
+```bash
+ctfctl backup && ctfctl reset --confirm
+```
+
+`reset` clears flags, uptime and submissions and puts the tick counter back to
+0, keeping the roster and deployed services. Skip it and you start the real
+game with your test steal on the board.
+
+### Viewing it from another machine
+
+The leaderboard binds the viewer address on the host, not `0.0.0.0` (RULES §9
+— the game plane must never reach the viewer edge). From a laptop on the same
+network, tunnel rather than re-binding anything:
+
+```bash
+ssh -f -N -L 8000:10.9.0.1:8000 -L 8001:10.9.0.1:8001 <you>@<host>
+# then: http://localhost:8000/
+```
+
+That is the whole setup for a host + laptop. No router port forwarding, no
+config change, nothing extra exposed.
+
+To let several people on a trusted LAN browse it without tunnels, set
+`net.viewer_bind` to the host's LAN IP **and** `net.viewer_cidr` to the LAN
+subnet (both, or footholds lose their route to the submission API), then
+restart `ctf-topology`, `ctf-leaderboard` and `ctf-submit`.
+
+### Players who are not on your network
+
+**Do not port-forward 8000/8001 to the internet.** The leaderboard and the
+submission API are plain HTTP with bearer tokens and no TLS: exposing them
+publishes submit tokens and, through the API, flags — in cleartext, to
+anyone who can watch the path or find the port.
+
+A remote player needs SSH to the host anyway, because their attacker foothold
+is a namespace on the host (`ctfctl foothold <name>`). So expose **SSH only**
+— ideally via WireGuard/Tailscale rather than a forwarded port 22 — and have
+them tunnel the two ports over it exactly as above. One door, keyed, and
+everything else rides through it.
+
+Give them a normal user account on the host plus a sudo rule for just their
+own foothold:
+
+```
+theirname ALL=(root) NOPASSWD: /usr/bin/ip netns exec ctf-foot-theirname *
+```
+
 ### Hand each player
 
 * their submit token: `ctfctl token <name>` (send privately — it is their

@@ -75,7 +75,27 @@ up() {
   ip link show "$VIEW_IF" >/dev/null 2>&1 || ip link add "$VIEW_IF" type bridge
   ip addr replace "${CTF_VIEWER_BIND}/${CTF_VIEWER_CIDR#*/}" dev "$VIEW_IF"
   ip link set "$VIEW_IF" mtu "$CTF_MTU" up
-  [ -n "${CTF_VIEWER_IFACE:-}" ] && ip link set "$CTF_VIEWER_IFACE" master "$VIEW_IF" up
+  if [ -n "${CTF_VIEWER_IFACE:-}" ]; then
+    # Enslaving a NIC into a bridge makes that NIC's own IP unusable. Do it to
+    # the interface carrying your default route and you lose SSH to this box
+    # on the spot, with no way back except a physical/serial console. Refuse,
+    # unless the operator insists and has console access.
+    default_if=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
+    has_addr=$(ip -4 addr show dev "$CTF_VIEWER_IFACE" scope global 2>/dev/null | grep -c 'inet ' || true)
+    if [ "$CTF_VIEWER_IFACE" = "$default_if" ] && [ "${CTF_VIEWER_IFACE_FORCE:-0}" != 1 ]; then
+      echo "networks.sh: REFUSING to enslave $CTF_VIEWER_IFACE — it carries this host's" >&2
+      echo "             default route. Bridging it would drop your SSH session." >&2
+      echo "             Either use a spare NIC/VPN interface, or just set" >&2
+      echo "             net.viewer_bind to this host's LAN IP (no bridging needed)." >&2
+      echo "             Override only from a console: CTF_VIEWER_IFACE_FORCE=1" >&2
+      exit 1
+    fi
+    if [ "$has_addr" -gt 0 ] && [ "${CTF_VIEWER_IFACE_FORCE:-0}" != 1 ]; then
+      echo "networks.sh: WARNING $CTF_VIEWER_IFACE has a global IPv4 address;" >&2
+      echo "             bridging it will make that address unusable." >&2
+    fi
+    ip link set "$CTF_VIEWER_IFACE" master "$VIEW_IF" up
+  fi
 
   # --- the router ------------------------------------------------------
   if [ "$MODE" = netns ]; then
