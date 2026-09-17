@@ -68,6 +68,22 @@ else
   echo "   keeping existing /etc/ctf/ctf.toml"
 fi
 
+echo "== version marker =="
+# So `ctfctl version` can tell you whether the host is running the code you
+# think it is, and whether anything has been hand-edited since.
+"${PY:-python3}" - "$PREFIX" <<'PYEOF' > "$PREFIX/.version"
+import hashlib, pathlib, sys, time
+root = pathlib.Path(sys.argv[1])
+h = hashlib.sha256()
+for f in sorted(p for d in ("orchestrator", "topology", "bin")
+                for p in (root / d).rglob("*") if p.is_file() and "__pycache__" not in str(p)):
+    h.update(str(f.relative_to(root)).encode()); h.update(f.read_bytes())
+print(f"installed={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")
+print(f"digest={h.hexdigest()}")
+PYEOF
+chmod 0644 "$PREFIX/.version"
+echo "   $(sed -n 's/^digest=//p' "$PREFIX/.version" | cut -c1-12)"
+
 echo "== sudo rules =="
 # The referee needs exactly two privileged verbs, nothing else.
 cat > /etc/sudoers.d/ctf <<EOF

@@ -149,6 +149,19 @@ theirname ALL=(root) NOPASSWD: /usr/bin/ip netns exec ctf-foot-theirname *
 | Build fails on a network error | Builders are offline by design. They must vendor dependencies. |
 | Transport-layer exploits never land | `rp_filter` back on somewhere, or `notrack` missing. `ctfctl topology verify` checks both. |
 
+## Updating mid-game
+
+```bash
+rsync -a --delete --exclude .git ./ <host>:/tmp/ctf-update/
+ssh <host> 'sudo /tmp/ctf-update/install.sh --no-packages && ctfctl version'
+sudo systemctl restart ctf-tick ctf-submit ctf-leaderboard ctf-watcher   # code
+sudo /opt/ctf/topology/networks.sh up                                    # firewall/routes
+```
+
+Never `systemctl restart ctf-topology` for a firewall change while people are
+playing — it stops every microVM. `networks.sh up` reloads the policy in
+place. Full table in `docs/OPERATIONS.md`.
+
 ## Mid-game controls
 
 ```bash

@@ -564,6 +564,43 @@ def cmd_selftest(args) -> int:
     return 0
 
 
+def _tree_digest() -> str:
+    import hashlib
+    h = hashlib.sha256()
+    for d in ("orchestrator", "topology", "bin"):
+        for f in sorted(p for p in (ROOT / d).rglob("*")
+                        if p.is_file() and "__pycache__" not in str(p)):
+            h.update(str(f.relative_to(ROOT)).encode())
+            h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+def cmd_version(args) -> int:
+    """Is this host running the code you think it is?"""
+    marker = ROOT / ".version"
+    recorded, installed = None, "unknown"
+    if marker.exists():
+        for line in marker.read_text().splitlines():
+            key, _, val = line.partition("=")
+            if key == "digest":
+                recorded = val
+            elif key == "installed":
+                installed = val
+    live = _tree_digest()
+    print(f"path      {ROOT}")
+    print(f"installed {installed}")
+    print(f"digest    {live[:16]}")
+    if recorded is None:
+        print(f"{Y}no .version marker — this tree was not put here by install.sh{X}")
+        return 0
+    if recorded == live:
+        print(f"{G}matches the installed version{X}")
+        return 0
+    print(f"{R}DRIFT{X}: files changed since install (recorded {recorded[:16]})")
+    print("  re-run install.sh from your working copy, or accept the hand edits")
+    return 1
+
+
 def cmd_preflight(args) -> int:
     return subprocess.run([str(ROOT / "bin" / "preflight.sh")]).returncode
 
@@ -581,6 +618,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("players").set_defaults(fn=cmd_players)
     sub.add_parser("preflight").set_defaults(fn=cmd_preflight)
     sub.add_parser("selftest").set_defaults(fn=cmd_selftest)
+    sub.add_parser("version").set_defaults(fn=cmd_version)
 
     p = sub.add_parser("deploy"); p.set_defaults(fn=cmd_deploy)
     p.add_argument("player", help="player name, or 'all'")

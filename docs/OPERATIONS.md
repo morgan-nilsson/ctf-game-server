@@ -75,6 +75,54 @@ service subnet, the submission API, and the leaderboard — nothing else.
 
 ---
 
+## Updating a running host
+
+The host runs from `/opt/ctf`, not your working copy. Nothing you edit
+locally takes effect until you copy it over and re-run the installer.
+
+```bash
+# from your working copy
+rsync -a --delete --exclude .git ./ <host>:/tmp/ctf-update/
+ssh <host>
+sudo /tmp/ctf-update/install.sh --no-packages     # idempotent; keeps /etc/ctf/ctf.toml
+ctfctl version                                     # confirm the digest changed
+```
+
+`install.sh` replaces `/opt/ctf` wholesale (so deleted files actually
+disappear), leaves your config alone, reloads systemd and re-enables the
+units. `--no-packages` skips apt, which is what you want for a code-only
+update.
+
+Then apply the change, picking the lightest option that covers it:
+
+| What changed | Apply with | Cost |
+|---|---|---|
+| `orchestrator/*.py`, `bin/ctfctl` | `systemctl restart ctf-tick ctf-submit ctf-leaderboard ctf-watcher` | a second; the tick resumes from the stored counter |
+| `topology/*.nft`, routes, `networks.sh` | `sudo /opt/ctf/topology/networks.sh up` | a sub-second packet blip while the ruleset reloads |
+| `topology/guest/*`, the rootfs | `sudo topology/build-rootfs.sh` then redeploy players | each guest reboots |
+| `service.toml` / player code | the player pushes; the watcher redeploys | 2 ticks of SLA grace |
+| systemd unit files | `systemctl daemon-reload` (install.sh does it) then restart that unit | as above |
+
+**Do not `systemctl restart ctf-topology` mid-game to pick up a firewall
+change.** Its `ExecStop` runs `vm.sh all-stop`, so every microVM goes down and
+everyone eats the downtime. `networks.sh up` is idempotent and reloads the
+policy, routes and offload settings without touching running VMs.
+
+After any update:
+
+```bash
+ctfctl version                 # digest matches, no drift
+ctfctl selftest                # the referee still works
+sudo ctfctl topology verify    # isolation still holds (after network changes)
+ctfctl status                  # services active, grid healthy
+```
+
+`ctfctl version` also catches the other direction: files hand-edited on the
+host since install show as `DRIFT`, which is what you want to know before
+blaming the code for behaving oddly.
+
+---
+
 ## Crashes, backups and restore
 
 **What survives what:**
