@@ -94,13 +94,25 @@ run_sandboxed() {
     # Preferred: full filesystem + network + IPC isolation.
     # --share-net re-enables networking after --unshare-all.
     NET_ARGS=""
-    [ "${CTF_BUILD_NETWORK:-0}" = 1 ] && NET_ARGS="--share-net"
+    DNS_ARGS=()
+    if [ "${CTF_BUILD_NETWORK:-0}" = 1 ]; then
+      NET_ARGS="--share-net"
+      # On Ubuntu /etc/resolv.conf is a symlink into /run (systemd-resolved),
+      # and /run is an empty tmpfs in here — so without this, the network
+      # works but every name lookup fails. Bind the real file's directory
+      # back in, read-only, at the same path so the symlink resolves.
+      resolv=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+      case "$resolv" in
+        /run/*) [ -e "$resolv" ] && DNS_ARGS=(--ro-bind "$(dirname "$resolv")" "$(dirname "$resolv")") ;;
+      esac
+    fi
     # shellcheck disable=SC2086
     bwrap \
       --unshare-all $NET_ARGS --die-with-parent --new-session \
       --ro-bind / / \
       --dev /dev --proc /proc \
       --tmpfs /run --tmpfs /tmp \
+      ${DNS_ARGS[@]+"${DNS_ARGS[@]}"} \
       ${MASK_ARGS[@]+"${MASK_ARGS[@]}"} \
       --bind "$WORK" "$WORK" --bind "$OUT" "$OUT" \
       --chdir "$WORK" \
