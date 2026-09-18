@@ -16,7 +16,9 @@ import logging
 import os
 import shlex
 import shutil
+import stat
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -96,28 +98,100 @@ def sync_repo(cfg: Config, player: Player, rev: str | None) -> tuple[Path, str]:
     return work, rev
 
 
+# --------------------------------------------------------------------------
+# Build output is PLAYER-CONTROLLED. Everything below runs as root over a tree
+# the build user wrote, so none of it may follow a symlink, open a special
+# file, or write through a path component the build could have planted.
+#
+# The concrete attacks this closes: a build leaves `leak -> /srv/ctf/state.db`
+# and a following copy puts the live flag store on the player's own disk; a
+# build makes `service.env` or `docroot` a symlink and root writes wherever it
+# points; a build leaves a FIFO or `-> /dev/zero` and the deploy hangs.
+# --------------------------------------------------------------------------
+
+def _ignore_special(directory: str, names: list[str]) -> list[str]:
+    """copytree ignore hook: keep only directories, regular files, symlinks."""
+    skip = []
+    for name in names:
+        try:
+            mode = os.lstat(os.path.join(directory, name)).st_mode
+        except OSError:
+            skip.append(name)
+            continue
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            skip.append(name)
+    return skip
+
+
+def copy_untrusted(src: Path, dst: Path) -> None:
+    """Copy a build-controlled tree without being steered by it: symlinks are
+    copied AS symlinks (never followed) and special files are dropped."""
+    shutil.copytree(src, dst, symlinks=True, ignore=_ignore_special)
+
+
+def ensure_real_dir(path: Path, root: Path) -> None:
+    """Make `path` a real directory, replacing any symlink or file the build
+    left at `root` or at any component between `root` and `path`."""
+    cur = root
+    for part in (("",) + path.relative_to(root).parts):
+        cur = cur / part if part else cur
+        if cur.is_symlink() or (cur.exists() and not cur.is_dir()):
+            cur.unlink()
+        cur.mkdir(exist_ok=True)
+
+
+def write_owned(path: Path, text: str) -> None:
+    """Write a file the orchestrator owns into a build-controlled directory:
+    remove whatever is there first (a symlink included — unlink removes the
+    link, not its target), then create it exclusively."""
+    if path.is_symlink() or path.exists():
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+    with os.fdopen(fd, "w") as fh:
+        fh.write(text)
+
+
 def tree_digest(root: Path) -> str:
     """Content hash of a build output, independent of filesystem metadata —
-    this is what makes two builds parity-comparable (RULES §8)."""
+    what makes two builds parity-comparable (RULES §8). Never follows a
+    symlink (hashes the link text instead) and never opens a special file."""
     h = hashlib.sha256()
-    for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        h.update(str(path.relative_to(root)).encode())
-        h.update(b"\0")
-        h.update(hashlib.sha256(path.read_bytes()).digest())
+    entries = []
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        for name in dirnames + filenames:
+            entries.append(Path(dirpath) / name)
+    for path in sorted(entries, key=lambda p: str(p.relative_to(root))):
+        rel = str(path.relative_to(root)).encode()
+        mode = path.lstat().st_mode
+        if stat.S_ISLNK(mode):
+            h.update(b"L" + rel + b"\0" + os.readlink(path).encode() + b"\0")
+        elif stat.S_ISREG(mode):
+            h.update(rel)
+            h.update(b"\0")
+            h.update(hashlib.sha256(path.read_bytes()).digest())
     return h.hexdigest()
 
 
 def build(cfg: Config, player: Player, src: Path, manifest: dict) -> tuple[Path, str, str]:
-    out = cfg.path_of("artifacts") / player.name / "build"
-    if out.exists():
-        shutil.rmtree(out)
-    out.mkdir(parents=True)
+    final = cfg.path_of("artifacts") / player.name / "build"
+    if final.exists():
+        shutil.rmtree(final)
+    final.parent.mkdir(parents=True, exist_ok=True)
+
+    # The build runs as the unprivileged build user, which deliberately
+    # cannot traverse /srv/ctf — the flag store lives there. So its output is
+    # staged somewhere it CAN write, and handed off pull-only: once the build
+    # has exited (and bwrap has killed everything it started), we copy the
+    # result out as root without following anything it left behind.
+    out = Path(tempfile.mkdtemp(prefix=f"ctf-out-{player.name}.",
+                                dir=os.environ.get("CTF_BUILD_TMP", "/var/tmp")))
 
     script = REPO_ROOT / "orchestrator" / "builder" / "sandbox-build.sh"
     timeout = str(int(cfg.p("game", "build_timeout", default=600)))
-    # Everything the referee owns is masked inside the build sandbox. $OUT is
-    # bound back in afterwards (bwrap applies these in order), so the build
-    # can still write its artifact.
+    # Everything the referee owns is masked inside the build sandbox.
     masked = [cfg.raw["paths"][k] for k in ("root", "state_db", "fixtures", "logs", "run")
               if k in cfg.raw["paths"]]
     offline = bool(cfg.p("game", "offline_builds", default=True))
@@ -127,11 +201,15 @@ def build(cfg: Config, player: Player, src: Path, manifest: dict) -> tuple[Path,
                CTF_BUILD_NETWORK="0" if offline else "1")
     if not offline:
         log.info("%s: building WITH network access (game.offline_builds = false)", player.name)
-    res = run([str(script), str(src), str(out), manifest["build"], timeout], env=env)
-    log_text = (res.stdout or "") + (res.stderr or "")
-    if res.returncode:
-        raise DeployError(f"build failed (exit {res.returncode})\n{log_text[-2000:]}")
-    return out, tree_digest(out), log_text
+    try:
+        res = run([str(script), str(src), str(out), manifest["build"], timeout], env=env)
+        log_text = (res.stdout or "") + (res.stderr or "")
+        if res.returncode:
+            raise DeployError(f"build failed (exit {res.returncode})\n{log_text[-2000:]}")
+        copy_untrusted(out, final)
+    finally:
+        shutil.rmtree(out, ignore_errors=True)
+    return final, tree_digest(final), log_text
 
 
 def plant_fixtures(cfg: Config, out: Path) -> None:
@@ -139,9 +217,19 @@ def plant_fixtures(cfg: Config, out: Path) -> None:
     props, never flags — flags only ever arrive over the wire, per tick."""
     fixtures = cfg.path_of("fixtures")
     docroot = out / "docroot"
-    docroot.mkdir(parents=True, exist_ok=True)
-    if fixtures.exists():
-        shutil.copytree(fixtures, docroot, dirs_exist_ok=True)
+    ensure_real_dir(docroot, out)
+    if not fixtures.exists():
+        return
+    for dirpath, _dirnames, filenames in os.walk(fixtures, followlinks=False):
+        rel = Path(dirpath).relative_to(fixtures)
+        target = docroot / rel
+        ensure_real_dir(target, docroot)
+        for name in filenames:
+            source = Path(dirpath) / name
+            if not source.is_file() or source.is_symlink():
+                continue
+            write_owned(target / name, "")          # clears any planted link
+            shutil.copyfile(source, target / name, follow_symlinks=False)
 
 
 def pack_disk(cfg: Config, player: Player, out: Path, manifest: dict) -> Path:
@@ -150,10 +238,10 @@ def pack_disk(cfg: Config, player: Player, out: Path, manifest: dict) -> Path:
     stage = artifacts / "stage"
     if stage.exists():
         shutil.rmtree(stage)
-    shutil.copytree(out, stage)
+    copy_untrusted(out, stage)
 
     # The guest init reads this to know what to start and with which caps.
-    (stage / "service.env").write_text(
+    write_owned(stage / "service.env",
         "\n".join([
             f"CTF_PLAYER={player.name}",
             f"CTF_RUN={manifest['run']}",

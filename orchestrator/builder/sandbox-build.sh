@@ -42,9 +42,22 @@ if [ -n "${CTF_STATE_DB:-}" ] && [ -f "$CTF_STATE_DB" ] \
   fi
 fi
 
+# Only directories can take a tmpfs, and there is no point masking something
+# already hidden: skip files (the state db lives inside paths.root, so masking
+# the root covers it), anything nested under an earlier mask, and anything
+# under /run or /tmp, which get their own tmpfs below.
 MASK_ARGS=()
-for masked in ${CTF_MASK:-}; do
-  [ -e "$masked" ] && MASK_ARGS+=(--tmpfs "$masked")
+MASKED=()
+for masked in $(printf '%s\n' ${CTF_MASK:-} | awk '{ print length, $0 }' | sort -n | cut -d' ' -f2-); do
+  [ -d "$masked" ] || continue
+  case "$masked" in /run|/run/*|/tmp|/tmp/*) continue ;; esac
+  covered=0
+  for m in ${MASKED[@]+"${MASKED[@]}"}; do
+    case "$masked" in "$m"/*) covered=1 ;; esac
+  done
+  [ "$covered" = 1 ] && continue
+  MASKED+=("$masked")
+  MASK_ARGS+=(--tmpfs "$masked")
 done
 mkdir -p "$OUT"
 
