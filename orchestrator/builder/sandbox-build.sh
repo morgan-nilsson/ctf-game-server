@@ -66,6 +66,9 @@ mkdir -p "$OUT"
 WORK=$(mktemp -d "${CTF_BUILD_TMP:-/var/tmp}/ctf-build.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 cp -a "$SRC/." "$WORK/"
+# Create everything the build writes into BEFORE handing the tree to the
+# build user below — anything made afterwards is root-owned and unwritable.
+mkdir -p "$WORK/tmp" "$OUT/docroot"
 chmod -R u+rwX "$WORK"
 
 if id "$BUILD_USER" >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
@@ -87,7 +90,6 @@ ENVIRON=(
   DOCROOT="$OUT/docroot"
   OUTDIR="$OUT"
 )
-mkdir -p "$WORK/tmp" "$OUT/docroot"
 
 run_sandboxed() {
   if command -v bwrap >/dev/null 2>&1; then
