@@ -26,10 +26,14 @@ MODE=${CTF_PLANE_MODE:-netns}
 # In netns mode the hypervisor must run inside the router namespace, because
 # that is where its tap lives. In host mode the tap is already enslaved to the
 # guest's bridge in the root namespace, so no netns wrapper is needed.
+#
+# This is an argv PREFIX, not a function: it has to sit inside the
+# systemd-run wrapper (capped), and systemd-run and `ip netns exec` can only
+# exec real programs — a shell function there fails with "exec ... failed".
 if [ "$MODE" = host ]; then
-  in_plane() { "$@"; }
+  PLANE=()
 else
-  in_plane() { ip netns exec "$GW" "$@"; }
+  PLANE=(ip netns exec "$GW")
 fi
 
 require_root() { [ "$(id -u)" = 0 ] || { echo "vm.sh: must run as root" >&2; exit 1; }; }
@@ -152,7 +156,7 @@ start_firecracker() {
 }
 JSON
   chown "$VM_USER":"$VM_USER" "$cfg" 2>/dev/null || true
-  in_plane capped setsid setpriv --reuid "$VM_USER" --regid "$VM_USER" --init-groups \
+  capped ${PLANE[@]+"${PLANE[@]}"} setsid setpriv --reuid "$VM_USER" --regid "$VM_USER" --init-groups \
     firecracker --api-sock "$API_SOCK" --config-file "$cfg" \
     >>"$LOGFILE" 2>&1 < /dev/null &
   echo $! > "$PIDFILE"
@@ -171,7 +175,7 @@ start_qemu() {
     echo "vm.sh: WARNING running $P_NAME under TCG — slow. Raise probe.timeout" >&2
     echo "       in the config or the SLA will flake on every tick." >&2
   fi
-  in_plane capped setsid setpriv --reuid "$VM_USER" --regid "$VM_USER" --init-groups \
+  capped ${PLANE[@]+"${PLANE[@]}"} setsid setpriv --reuid "$VM_USER" --regid "$VM_USER" --init-groups \
     qemu-system-x86_64 \
       -machine microvm,accel="$accel" -cpu "$cpu" -smp "$CTF_VCPUS" -m "$CTF_MEM_MIB" \
       -nodefaults -no-user-config -nographic -serial mon:stdio \

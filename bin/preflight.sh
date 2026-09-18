@@ -47,7 +47,12 @@ echo "== python =="
 
 echo "== config =="
 CFG=${CTF_CONFIG:-/etc/ctf/ctf.toml}
-if [ -f "$CFG" ]; then
+CFG_OK=1
+if [ -f "$CFG" ] && [ ! -r "$CFG" ]; then
+  # 0640 root:ctf on purpose — it holds every player's submit token.
+  bad "cannot read $CFG as $(id -un) — run: sudo ctfctl preflight"
+  CFG_OK=0
+elif [ -f "$CFG" ]; then
   if (cd "$ROOT" && CTF_CONFIG="$CFG" "$PY" -m orchestrator.topology env >/dev/null 2>&1); then
     players=$(cd "$ROOT" && CTF_CONFIG="$CFG" "$PY" -m orchestrator.topology env \
               | sed -n "s/^CTF_PLAYERS=//p" | tr -d "'\"")
@@ -66,7 +71,9 @@ else
 fi
 
 echo "== guest image =="
-if [ -f "$CFG" ]; then
+if [ "$CFG_OK" = 0 ]; then
+  warn "skipped — needs the config (sudo ctfctl preflight)"
+elif [ -f "$CFG" ]; then
   eval "$(cd "$ROOT" && CTF_CONFIG="$CFG" "$PY" -m orchestrator.topology env 2>/dev/null | grep -E '^CTF_(KERNEL|ROOTFS|HYPERVISOR)=')" 2>/dev/null || true
   [ -f "${CTF_ROOTFS:-}" ] && ok "guest rootfs ${CTF_ROOTFS}" \
     || bad "no guest rootfs at '${CTF_ROOTFS:-unset}' — run: sudo topology/build-rootfs.sh"
