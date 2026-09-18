@@ -17,7 +17,7 @@ import threading
 import time
 
 from .config import load as load_config
-from .deploy import DeployError, deploy, run
+from .deploy import DeployError, deploy, git_env, run
 from .state import Store
 
 log = logging.getLogger("watcher")
@@ -25,7 +25,8 @@ _stop = threading.Event()
 
 
 def remote_head(player) -> str | None:
-    res = run(["git", "ls-remote", "--heads", player.repo, player.branch])
+    res = run(["git", "ls-remote", "--heads", player.repo, player.branch],
+              env=git_env(player))
     if res.returncode:
         log.warning("%s: ls-remote failed: %s", player.name, res.stderr.strip()[:200])
         return None

@@ -20,6 +20,7 @@ class Player:
     repo: str
     branch: str
     submit_token: str
+    ssh_key: str               # deploy key for their repo (one per repo)
     subnet: str                # service subnet, e.g. 10.0.3.0/24
     host: str                  # address the player's stack answers on (.2)
     kernel_addr: str           # tun0 kernel side (.1)
@@ -139,6 +140,9 @@ def _derive(idx: int, raw: dict, entry: dict) -> Player:
         repo=entry.get("repo", ""),
         branch=entry.get("branch", "main"),
         submit_token=entry.get("submit_token", ""),
+        # A GitHub deploy key is valid for exactly one repository, so each
+        # player needs their own. This is the path `ctfctl keygen` writes.
+        ssh_key=entry.get("ssh_key", f"/etc/ctf/keys/{entry['name']}"),
         subnet=subnet,
         host=entry.get("host", f"{base}.2"),
         kernel_addr=entry.get("kernel_addr", f"{base}.1"),

@@ -14,6 +14,7 @@ import argparse
 import hashlib
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -39,6 +40,25 @@ def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
 
 
+def git_env(player) -> dict:
+    """Environment for git operations against one player's repo.
+
+    The key is named explicitly rather than left to ~/.ssh or an agent,
+    because these commands run as different users depending on the trigger:
+    root from the watcher, you from `ctfctl deploy`. An agent-based setup
+    gives you a deploy that works by hand and fails from the service.
+    """
+    env = dict(os.environ)
+    key = getattr(player, "ssh_key", "")
+    if key and Path(key).is_file():
+        env["GIT_SSH_COMMAND"] = (
+            f"ssh -i {shlex.quote(str(key))} -o IdentitiesOnly=yes "
+            "-o StrictHostKeyChecking=accept-new -o BatchMode=yes -o ConnectTimeout=10"
+        )
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")   # fail fast, never hang on a prompt
+    return env
+
+
 def _sudo(cmd: list[str]) -> list[str]:
     return cmd if os.geteuid() == 0 else ["sudo", "-n", *cmd]
 
@@ -49,13 +69,14 @@ def sync_repo(cfg: Config, player: Player, rev: str | None) -> tuple[Path, str]:
     their repo — the orchestrator never pushes."""
     mirror = cfg.path_of("repos") / f"{player.name}.git"
     mirror.parent.mkdir(parents=True, exist_ok=True)
+    env = git_env(player)
     if not mirror.exists():
-        res = run(["git", "clone", "--mirror", player.repo, str(mirror)])
+        res = run(["git", "clone", "--mirror", player.repo, str(mirror)], env=env)
         if res.returncode:
             raise DeployError(f"git clone failed: {res.stderr.strip()[:400]}")
     else:
         res = run(["git", "--git-dir", str(mirror), "fetch", "--prune", "origin",
-                   f"+refs/heads/{player.branch}:refs/heads/{player.branch}"])
+                   f"+refs/heads/{player.branch}:refs/heads/{player.branch}"], env=env)
         if res.returncode:
             raise DeployError(f"git fetch failed: {res.stderr.strip()[:400]}")
 

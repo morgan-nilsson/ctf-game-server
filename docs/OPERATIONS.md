@@ -25,7 +25,48 @@ is unattackable" and "we assumed the referee was unattackable".
 
 ---
 
-## Adding the Nth player
+## Adding a person to the game
+
+Two halves: **access to the host**, then **a slot in the game**. A remote
+player needs both — their attacker foothold is a namespace *on the host*, so
+there is no way to play without a login here.
+
+### 1. Let them reach the host
+
+Tailscale, so nothing is exposed publicly:
+
+* Admin console → **Users → Invite** → send the link. They install Tailscale
+  and `tailscale up`; the host is then reachable at its `100.x` address or
+  MagicDNS name, from anywhere.
+* Prefer inviting them to the tailnet over sharing a single node if they will
+  also want to reach the leaderboard.
+* Set an ACL if your tailnet has machines they should not touch.
+
+### 2. Give them a login and their own foothold
+
+```bash
+sudo adduser --disabled-password --gecos "" friend
+sudo install -d -m 700 -o friend -g friend /home/friend/.ssh
+# paste THEIR public key:
+sudo tee /home/friend/.ssh/authorized_keys <<< 'ssh-ed25519 AAAA... them@laptop'
+sudo chown friend:friend /home/friend/.ssh/authorized_keys
+sudo chmod 600 /home/friend/.ssh/authorized_keys
+```
+
+Then let them into **their own** foothold and nothing else:
+
+```bash
+echo 'friend ALL=(root) NOPASSWD: /usr/bin/ip netns exec ctf-foot-friend *' \
+  | sudo tee /etc/sudoers.d/ctf-foothold-friend
+sudo chmod 440 /etc/sudoers.d/ctf-foothold-friend
+sudo visudo -cf /etc/sudoers.d/ctf-foothold-friend
+```
+
+Name the namespace after *their* player name. Do not give them blanket sudo:
+root on the host is root over the referee, the flag store and their
+opponent's VM, which ends the game (RULES §9).
+
+### 3. Give them a slot in the game
 
 1. Add a `[[players]]` block to `/etc/ctf/ctf.toml` (name, repo, branch, a
    fresh `submit_token`). Everything else — service subnet, VM link, foothold
@@ -33,7 +74,23 @@ is unattackable" and "we assumed the referee was unattackable".
 2. `ctfctl topology apply` — creates the new tap, foothold namespace, routes
    and firewall entries. Existing players are untouched.
 3. `ctfctl deploy <name>`.
-4. `ctfctl token <name>` and send them the token over a private channel.
+4. If their repo is private, `sudo ctfctl keygen <name>` and have them paste
+   the printed public key into their repo as a read-only deploy key.
+5. `ctfctl token <name>` and send them the token over a private channel — it
+   is their scoring identity, and anyone holding it can submit as them.
+
+### 4. Hand them
+
+* the leaderboard URL (their tunnel, or the `serve` address)
+* `docs/PLAYER-QUICKSTART.md` and `docs/NOTE-API.md`
+* their submit token and the `curl` line from `ctfctl token`
+* how to attack: `ssh <host>` then `sudo ip netns exec ctf-foot-<name> -- bash`
+
+Generate a token with:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(24))"
+```
 
 Removing a player: delete the block and `ctfctl topology apply`. Their history
 stays in the ledger; they are marked `disabled` and stop being probed.
