@@ -48,8 +48,11 @@ must_fail_ping "$CONTROL" "control plane (icmp)"
 
 # Peer services: a compromised service must not become a pivot into anyone
 # else's guest. Attacks come from footholds, never from a service.
+PEER_PORT=${CTF_TCP_PORT:-0}
+[ "$PEER_PORT" = 0 ] && PEER_PORT=8080   # udp-only manifests carry tcp_port=0
 for peer in $PEERS; do
-  must_fail_tcp "$peer" "${CTF_TCP_PORT:-8080}" "peer service $peer"
+  must_fail_ping "$peer" "peer service $peer (icmp)"
+  must_fail_tcp "$peer" "$PEER_PORT" "peer service $peer"
 done
 
 # The internet. Builders are offline and so is the game plane; a service that

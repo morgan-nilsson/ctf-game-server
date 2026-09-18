@@ -39,6 +39,12 @@ mount -t tmpfs tmp   /tmp       2>/dev/null
 mkdir -p /dev/pts /dev/net /srv/app
 mount -t devpts devpts /dev/pts 2>/dev/null
 [ -c /dev/net/tun ] || mknod /dev/net/tun c 10 200
+# The tun driver registers no mode, so devtmpfs creates the node 0600 root;
+# on a normal system udev relaxes it to 0666. There is no udev here, so do it
+# ourselves — otherwise the unprivileged service gets EACCES opening it.
+# 0666 is the stock distro default and grants nothing by itself: attaching to
+# tun0 still requires owning it, and it is owned by `app`.
+chmod 0666 /dev/net/tun
 
 log "mounting the deployed service"
 mount -o rw /dev/vdb /srv/app || { log "FATAL: no data disk on /dev/vdb"; exec /bin/sh; }
@@ -82,7 +88,7 @@ set_sysctl net.ipv4.conf.eth0.rp_filter 0
 
 # RULES §5 parity — offload off, identically on every host, or L4 checksums
 # arrive unfilled and interop flakes in ways that look like your bug.
-ethtool -K eth0 tx off rx off tso off gso off gro off 2>/dev/null
+ethtool -K eth0 tx off rx off tso off gso off gro off >/dev/null 2>&1
 
 # --- tun0: your stack's L3 boundary ---------------------------------------
 # Persistent and owned by the unprivileged service user, so the player's
@@ -91,7 +97,7 @@ ip tuntap add dev tun0 mode tun user app 2>/dev/null
 ip addr replace "${CTF_KERNEL_ADDR}/${CTF_SUBNET#*/}" dev tun0 2>/dev/null
 ip link set tun0 mtu "$CTF_MTU" up
 set_sysctl net.ipv4.conf.tun0.rp_filter 0
-ethtool -K tun0 tx off rx off 2>/dev/null        # else L4 checksums arrive unfilled
+ethtool -K tun0 tx off rx off >/dev/null 2>&1   # else L4 checksums arrive unfilled
 
 log "eth0 ${CTF_LINK_ADDR} via ${CTF_LINK_GW}; tun0 kernel ${CTF_KERNEL_ADDR}, your stack answers ${CTF_ADDR}"
 ip -br addr  > /dev/console 2>&1
