@@ -104,7 +104,17 @@ load_player() {
   chown "$VM_USER":"$VM_USER" "$VMDIR" 2>/dev/null || true
 }
 
-is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+# The VM runs in a named systemd scope (see capped), and the scope is the
+# reliable handle: it tracks every process in the VM's cgroup no matter how
+# the launch chain forked. A PID file is only the fallback for hosts without
+# systemd-run.
+scope_name() { echo "ctf-vm-$P_NAME.scope"; }
+scope_active() { have systemctl && systemctl is-active --quiet "$(scope_name)" 2>/dev/null; }
+
+is_running() {
+  scope_active && return 0
+  [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
 
 mac_for() {  # stable, locally administered, derived from the player index
   printf '02:00:00:00:%02x:%02x' $(( P_INDEX / 256 )) $(( P_INDEX % 256 ))
@@ -264,11 +274,25 @@ stop() {
   require_root
   load_player "$1"
   if [ "$CTF_HYPERVISOR" = libvirt ]; then stop_libvirt; return 0; fi
-  if ! is_running; then rm -f "$PIDFILE"; echo "vm.sh: $P_NAME not running"; return 0; fi
-  local pid; pid=$(cat "$PIDFILE")
-  kill -TERM "$pid" 2>/dev/null || true
-  for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
-  kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  if ! is_running; then
+    rm -f "$PIDFILE"
+    # A dead-but-loaded scope would still block the next start.
+    have systemctl && systemctl reset-failed "$(scope_name)" 2>/dev/null || true
+    echo "vm.sh: $P_NAME not running"
+    return 0
+  fi
+  if scope_active; then
+    # Stops every process in the VM's cgroup: TERM, then KILL after the
+    # timeout. Nothing the launch chain forked can survive this.
+    systemctl stop "$(scope_name)" 2>/dev/null || true
+  fi
+  if [ -f "$PIDFILE" ]; then
+    local pid; pid=$(cat "$PIDFILE")
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+  fi
+  have systemctl && systemctl reset-failed "$(scope_name)" 2>/dev/null || true
   rm -f "$PIDFILE" "$API_SOCK"
   echo "vm.sh: $P_NAME stopped"
 }
@@ -280,7 +304,7 @@ status() {
     return 0
   fi
   if is_running; then
-    echo "$P_NAME: running pid=$(cat "$PIDFILE") addr=$P_HOST tap=$P_TAP"
+    echo "$P_NAME: running ($(scope_name)) addr=$P_HOST tap=$P_TAP"
   else
     echo "$P_NAME: stopped"
   fi
