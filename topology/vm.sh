@@ -88,11 +88,20 @@ load_player() {
   eval "$("$PY" -m orchestrator.topology player "$1")"
   PIDFILE="$CTF_RUN/vm-$P_NAME.pid"
   LOGFILE="$CTF_LOGS/vm-$P_NAME.log"
-  VMDIR="$CTF_ARTIFACTS/$P_NAME"
+  # deploy.py writes the data disk here, as root, inside the referee's tree.
+  DATA_SRC="$CTF_ARTIFACTS/$P_NAME/data.ext4"
+  # Everything the hypervisor itself opens lives in its own directory instead,
+  # owned by the VM user. The hypervisor runs unprivileged and deliberately
+  # cannot traverse /srv/ctf (the flag store lives there), so it gets copies
+  # made by root rather than access to the originals.
+  VMDIR="${CTF_VM_STATE:-/var/lib/ctf-vm}/$P_NAME"
   ROOTFS_COPY="$VMDIR/rootfs.ext4"
   DATA="$VMDIR/data.ext4"
-  API_SOCK="$CTF_RUN/fc-$P_NAME.sock"
-  mkdir -p "$CTF_RUN" "$CTF_LOGS" "$VMDIR"
+  KERNEL_COPY="$VMDIR/kernel"
+  API_SOCK="$VMDIR/fc.sock"
+  mkdir -p "$CTF_RUN" "$CTF_LOGS"
+  install -d -m 0700 "$VMDIR"
+  chown "$VM_USER":"$VM_USER" "$VMDIR" 2>/dev/null || true
 }
 
 is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
@@ -102,11 +111,13 @@ mac_for() {  # stable, locally administered, derived from the player index
 }
 
 prepare_disks() {
-  [ -f "$DATA" ] || { echo "vm.sh: no data disk for $P_NAME yet — deploy first" >&2; return 1; }
+  [ -f "$DATA_SRC" ] || { echo "vm.sh: no data disk for $P_NAME yet — deploy first" >&2; return 1; }
+  rm -f "$DATA"
+  cp --reflink=auto "$DATA_SRC" "$DATA"
+  chown "$VM_USER":"$VM_USER" "$DATA" 2>/dev/null || true
   if [ "$CTF_HYPERVISOR" = libvirt ]; then
     # The domain's root disk belongs to libvirt. We only ever hand it the
     # freshly built data disk, which its XML must reference as vdb.
-    chown "$VM_USER":"$VM_USER" "$DATA" 2>/dev/null || true
     return 0
   fi
   [ -f "$CTF_ROOTFS" ] || { echo "vm.sh: base rootfs missing: $CTF_ROOTFS (run topology/build-rootfs.sh)" >&2; return 1; }
@@ -114,7 +125,15 @@ prepare_disks() {
   # wipes any persistence an attacker established inside the guest.
   rm -f "$ROOTFS_COPY"
   cp --reflink=auto "$CTF_ROOTFS" "$ROOTFS_COPY"
-  chown "$VM_USER":"$VM_USER" "$ROOTFS_COPY" "$DATA" 2>/dev/null || true
+  chown "$VM_USER":"$VM_USER" "$ROOTFS_COPY" 2>/dev/null || true
+  # Ubuntu ships /boot/vmlinuz-* as 0600 root, so the unprivileged hypervisor
+  # cannot read it in place. Hand it a copy.
+  if [ -n "${CTF_KERNEL:-}" ] && [ -f "$CTF_KERNEL" ]; then
+    cp "$CTF_KERNEL" "$KERNEL_COPY"
+    chown "$VM_USER":"$VM_USER" "$KERNEL_COPY" 2>/dev/null || true
+    chmod 0400 "$KERNEL_COPY"
+    CTF_KERNEL="$KERNEL_COPY"
+  fi
 }
 
 # Kernel cmdline: static link address, no DHCP, serial console.

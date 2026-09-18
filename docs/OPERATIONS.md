@@ -353,7 +353,7 @@ Use `host` mode when **libvirt owns the guests**. Then set
   <model type='virtio'/>
 </interface>
 <disk type='file' device='disk'>
-  <source file='/srv/ctf/artifacts/morgan/data.ext4'/>
+  <source file='/var/lib/ctf-vm/morgan/data.ext4'/>
   <target dev='vdb' bus='virtio'/>     <!-- ctf-init mounts vdb at /srv/app -->
 </disk>
 ```
