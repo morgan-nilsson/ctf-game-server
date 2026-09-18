@@ -34,6 +34,10 @@ eval "$("$PY" -m orchestrator.topology env)"
 MODE=${CTF_PLANE_MODE:-netns}
 
 require_root() { [ "$(id -u)" = 0 ] || { echo "networks.sh: must run as root" >&2; exit 1; }; }
+# Named namespaces live at /run/netns/<name>. Don't parse `ip netns list`:
+# once a namespace holds a link it prints as "name (id: N)", so an exact-line
+# match silently stops working after the first `up`.
+ns_exists() { [ -e "/run/netns/$1" ]; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 load_players() {
@@ -99,7 +103,7 @@ up() {
 
   # --- the router ------------------------------------------------------
   if [ "$MODE" = netns ]; then
-    ip netns list | grep -qx "$GW" || ip netns add "$GW"
+    ns_exists "$GW" || ip netns add "$GW"
     ns ip link set lo up
     if ! ip link show gwc0 >/dev/null 2>&1; then
       ip link add gwc0 type veth peer name gwc1
@@ -179,7 +183,7 @@ up() {
     fi
 
     # --- the attacker foothold ------------------------------------------
-    ip netns list | grep -qx "$fns" || ip netns add "$fns"
+    ns_exists "$fns" || ip netns add "$fns"
     if ! ns ip link show "$vh" >/dev/null 2>&1; then
       ns ip link add "$vh" type veth peer name "$vn"
       ns ip link set "$vn" netns "$fns"
@@ -310,7 +314,7 @@ status() {
   ip -br addr show "$CTRL_IF" 2>/dev/null || echo "  $CTRL_IF missing"
   ip -br addr show "$VIEW_IF" 2>/dev/null || echo "  $VIEW_IF missing"
   echo "== game plane =="
-  if [ "$MODE" = netns ] && ! ip netns list | grep -qx "$GW"; then
+  if [ "$MODE" = netns ] && ! ns_exists "$GW"; then
     echo "  router namespace missing — run: networks.sh up"
   else
     ns ip -br addr

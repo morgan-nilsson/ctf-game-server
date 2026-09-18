@@ -33,6 +33,10 @@ else
 fi
 
 require_root() { [ "$(id -u)" = 0 ] || { echo "vm.sh: must run as root" >&2; exit 1; }; }
+# Named namespaces live at /run/netns/<name>. Don't parse `ip netns list`:
+# once a namespace holds a link it prints as "name (id: N)", so an exact-line
+# match silently stops working after the first `up`.
+ns_exists() { [ -e "/run/netns/$1" ]; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # Run the hypervisor inside a systemd scope with hard memory and CPU caps.
@@ -216,7 +220,7 @@ start() {
   fi
   if is_running; then echo "vm.sh: $P_NAME already running (pid $(cat "$PIDFILE"))"; return 0; fi
   if [ "$MODE" = netns ]; then
-    ip netns list | grep -qx "$GW" || { echo "vm.sh: run topology/networks.sh up first" >&2; return 1; }
+    ns_exists "$GW" || { echo "vm.sh: run topology/networks.sh up first" >&2; return 1; }
   fi
   resolve_kernel
   prepare_disks || return 1
