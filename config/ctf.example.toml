@@ -26,6 +26,12 @@ sla_grace_ticks       = 2     # RULES §8  post-redeploy immunity
 redeploy_min_interval = 90    # RULES §8  seconds, per service
 defense_bonus         = 0     # RULES §7 optional: +N/tick per unstolen protocol (0 = off)
 udp_flag_fixture      = false # RULES §3 transport-level flag surface on the UDP rung
+# RULES §9 says builders are offline, which means players must vendor their
+# dependencies. Set false to let builds reach the internet instead — the
+# sandbox still blocks the build from reaching the CTF planes (referee,
+# leaderboard, other players' services), so the trade is supply-chain trust,
+# not a hole in the game. Tell your players if you change this.
+offline_builds        = true
 max_players           = 64    # guards the /8 allocations below
 # FULL fsyncs every commit: an accepted steal is durable the instant the
 # player is told it scored, even through a power cut. NORMAL is faster and

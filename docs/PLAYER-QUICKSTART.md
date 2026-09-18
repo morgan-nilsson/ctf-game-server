@@ -54,8 +54,19 @@ ctfctl validate service.toml
 
 ## 4. Building
 
-Builds run **offline**, in a sandbox, as a user that cannot see any flag.
-Vendor your dependencies. Set `SOURCE_DATE_EPOCH` if your toolchain needs it;
+Builds run in a sandbox, as a user that cannot see any flag.
+
+Whether they have network depends on how your organiser set
+`game.offline_builds`:
+
+* **`true` (default, RULES §9)** — no network at all. Vendor your
+  dependencies (`go mod vendor`, `cargo vendor`, `pip download`, …) and
+  commit them, or a fetch will fail the build.
+* **`false`** — the build may reach the internet, so `go mod download`,
+  `cargo fetch` and friends work normally. It still cannot reach the referee,
+  the leaderboard or anyone's service.
+
+Ask your organiser which one you are on; `ctfctl deploy` logs it. Set `SOURCE_DATE_EPOCH` if your toolchain needs it;
 it is already exported. Reproducible builds are required (RULES §8) — the
 orchestrator records the content hash of each build so artifacts stay
 parity-comparable.

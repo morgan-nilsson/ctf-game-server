@@ -49,6 +49,7 @@ fi
 # shellcheck disable=SC1091
 . /srv/app/service.env
 export DOCROOT CTF_ADDR CTF_KERNEL_ADDR CTF_SUBNET CTF_TCP_PORT CTF_UDP_PORT
+export CTF_PLAYER CTF_MTU CTF_PEERS
 
 log "player=$CTF_PLAYER addr=$CTF_ADDR subnet=$CTF_SUBNET mtu=$CTF_MTU"
 

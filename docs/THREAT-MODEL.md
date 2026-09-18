@@ -78,6 +78,15 @@ What the code does now:
 * if `bwrap` is missing, the weaker `unshare` path **refuses to build at all**
   when the build user can actually read the store.
 
+**Optional relaxation:** `game.offline_builds = false` gives builds internet
+access so players need not vendor dependencies. This is a deliberate trade —
+you are accepting supply-chain trust in whatever they pull — and it is a
+change to RULES §9, so tell your players. It is **not** a hole in the game:
+the sandbox still masks the flag store, and a host firewall rule pinned to
+the build user's uid rejects any packet from a build to the control plane,
+the viewer edge or any player subnet. A build can reach npm; it cannot reach
+the referee or its opponent.
+
 **Residual:** the builder shares the host kernel. A kernel LPE from the build
 user owns the host. The proper fix is a build microVM with pull-only artifact
 handoff — not built; the mitigations above are what stands.

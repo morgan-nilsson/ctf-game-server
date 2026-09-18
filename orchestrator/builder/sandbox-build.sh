@@ -4,9 +4,12 @@
 #   no flags     : runs as the unprivileged build user, which has no read
 #                  access to the state db or the fixtures tree
 #   no secrets   : the environment is wiped; only SOURCE_DATE_EPOCH et al survive
-#   no egress    : the build runs in a fresh, empty network namespace, so a
-#                  build-time fetch cannot reach a mirror, let alone the
-#                  internet (RULES §9 — builders are offline). Vendor your deps.
+#   egress       : off by default (RULES §9 — builders are offline, so deps
+#                  must be vendored). Set CTF_BUILD_NETWORK=1 (config:
+#                  game.offline_builds = false) to allow package fetches.
+#                  Even then the build cannot reach the CTF planes: the host
+#                  firewall drops traffic from the build user to the referee,
+#                  the viewer edge and every player subnet.
 #   reproducible : fixed TZ/locale/umask + SOURCE_DATE_EPOCH (RULES §8)
 #
 # usage: sandbox-build.sh <srcdir> <outdir> <build-cmd> [timeout-seconds]
@@ -76,8 +79,12 @@ mkdir -p "$WORK/tmp" "$OUT/docroot"
 run_sandboxed() {
   if command -v bwrap >/dev/null 2>&1; then
     # Preferred: full filesystem + network + IPC isolation.
+    # --share-net re-enables networking after --unshare-all.
+    NET_ARGS=""
+    [ "${CTF_BUILD_NETWORK:-0}" = 1 ] && NET_ARGS="--share-net"
+    # shellcheck disable=SC2086
     bwrap \
-      --unshare-all --die-with-parent --new-session \
+      --unshare-all $NET_ARGS --die-with-parent --new-session \
       --ro-bind / / \
       --dev /dev --proc /proc \
       --tmpfs /run --tmpfs /tmp \
@@ -87,17 +94,24 @@ run_sandboxed() {
       -- "${ENVIRON[@]}" /bin/sh -c "umask 022; exec $CMD"
   else
     # Fallback: at minimum, no network namespace.
-    echo "sandbox-build: bwrap not found, falling back to unshare -n" >&2
+    echo "sandbox-build: bwrap not found, falling back to unshare" >&2
+    UNSHARE_NET="--net"
+    [ "${CTF_BUILD_NETWORK:-0}" = 1 ] && UNSHARE_NET=""
     # Pass the paths and the build command as positional arguments rather
     # than interpolating them into a quoted string, so a quote in either
     # cannot break out of the sandbox invocation.
-    unshare --net --mount --pid --fork -- \
+    # shellcheck disable=SC2086
+    unshare $UNSHARE_NET --mount --pid --fork -- \
       "${ENVIRON[@]}" /bin/sh -c \
         'cd "$1" || exit 1; umask 022; exec /bin/sh -c "$2"' _ "$WORK" "$CMD"
   fi
 }
 
-echo "sandbox-build: building in $WORK (offline, as ${BUILD_USER}, timeout ${TIMEOUT}s)"
+if [ "${CTF_BUILD_NETWORK:-0}" = 1 ]; then
+  echo "sandbox-build: building in $WORK (NETWORK ALLOWED, as ${BUILD_USER}, timeout ${TIMEOUT}s)"
+else
+  echo "sandbox-build: building in $WORK (offline, as ${BUILD_USER}, timeout ${TIMEOUT}s)"
+fi
 
 # One command string, run either directly or after dropping privileges.
 INNER=(bash -c "$(declare -f run_sandboxed); $(declare -p ENVIRON WORK OUT CMD MASK_ARGS); run_sandboxed")

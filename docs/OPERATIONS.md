@@ -298,8 +298,20 @@ checksum offload off (RULES §5): `ethtool -K tun0 tx off rx off` in the guest
 service (RULES §8). `--force` overrides; do not make that a habit, it is the
 anti-rebuild-to-dodge-exploitation rule.
 
-**A build fails with a network error.** Also working as intended: builders are
-offline (RULES §9). Vendor the dependency into the repo.
+**A build fails with a network error.** Working as intended by default:
+builders are offline (RULES §9), so dependencies must be vendored. If that is
+too much friction for your group, flip it:
+
+```toml
+[game]
+offline_builds = false
+```
+
+then `sudo /opt/ctf/topology/networks.sh up` (reloads the build-egress rules)
+and the next deploy fetches normally. The build still cannot reach the
+referee, the viewer edge or any player subnet — that restriction is pinned to
+the build user's uid and stays on either way. Tell your players, since it
+changes RULES §9 for your game.
 
 **Firecracker won't boot.** `ls /dev/kvm`. No KVM means no microVM — switch to
 `vm.hypervisor = "qemu-tcg"` and raise `probe.timeout`, or drop RCE from scope

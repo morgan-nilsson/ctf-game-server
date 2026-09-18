@@ -232,6 +232,16 @@ firewall() {
 }
 
 host_firewall() {
+  # Build-user egress restrictions, applied whether or not builds are online.
+  BUILD_RULES=""
+  if id -u "${CTF_BUILD_USER:-ctf-build}" >/dev/null 2>&1; then
+    BUILD_USER_NAME=${CTF_BUILD_USER:-ctf-build}
+    BUILD_RULES=$(printf '    meta skuid "%s" ip daddr { %s, %s, %s } counter reject\n' \
+      "$BUILD_USER_NAME" "$CTF_CONTROL_CIDR" "$CTF_VIEWER_CIDR" "$(IFS=,; echo "${SVC_NETS[*]}")")
+  else
+    BUILD_USER_NAME=${CTF_BUILD_USER:-ctf-build}
+    echo "networks.sh: note: user $BUILD_USER_NAME does not exist; skipping build egress rules" >&2
+  fi
   # Defense in depth in the root namespace: a service may never *initiate*
   # anything that terminates on the host, but replies to referee probes must
   # still come back. Scoped to service subnets only — foothold traffic to the
@@ -254,6 +264,15 @@ table inet ctf_host {
     iifname "${CTRL_IF}" oifname "${VIEW_IF}" counter drop
     iifname "${VIEW_IF}" oifname "${CTRL_IF}" counter drop
   }
+
+  chain output {
+    type filter hook output priority -10;
+    # Player build code runs as ${BUILD_USER} on this host. With
+    # game.offline_builds = false it gets the internet so dependencies can be
+    # fetched — but it must still never reach the referee, the viewer edge or
+    # anyone's service. Pinning by uid keeps that true whether builds are
+    # online or not.
+${BUILD_RULES}  }
 }
 NFT
 }

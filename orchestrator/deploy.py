@@ -120,9 +120,13 @@ def build(cfg: Config, player: Player, src: Path, manifest: dict) -> tuple[Path,
     # can still write its artifact.
     masked = [cfg.raw["paths"][k] for k in ("root", "state_db", "fixtures", "logs", "run")
               if k in cfg.raw["paths"]]
+    offline = bool(cfg.p("game", "offline_builds", default=True))
     env = dict(os.environ,
                CTF_MASK=" ".join(str(m) for m in masked),
-               CTF_STATE_DB=str(cfg.path_of("state_db")))
+               CTF_STATE_DB=str(cfg.path_of("state_db")),
+               CTF_BUILD_NETWORK="0" if offline else "1")
+    if not offline:
+        log.info("%s: building WITH network access (game.offline_builds = false)", player.name)
     res = run([str(script), str(src), str(out), manifest["build"], timeout], env=env)
     log_text = (res.stdout or "") + (res.stderr or "")
     if res.returncode:
