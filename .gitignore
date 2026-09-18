@@ -1,0 +1,22 @@
+# Python bytecode — regenerated on every run, and install.sh clears it on the
+# host anyway. Committing it makes every diff noisy.
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local scratch
+*.swp
+.DS_Store
+/tmp/
+*.log
+
+# Never commit anything that could carry a live flag or a submit token.
+# The real ones live in /etc/ctf and /srv/ctf on the host, but it is cheap to
+# make an accident impossible.
+ctf.toml
+!config/ctf.example.toml
+state.db
+state.db-*
+scoreboard.json
+*.ext4
+vmlinux

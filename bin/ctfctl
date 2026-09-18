@@ -34,6 +34,7 @@ from orchestrator.config import load as load_config          # noqa: E402
 from orchestrator.deploy import DeployError, deploy          # noqa: E402
 from orchestrator.state import Store                         # noqa: E402
 from orchestrator.validate import ManifestError, load as load_manifest  # noqa: E402
+from orchestrator.version import tree_digest                            # noqa: E402
 
 G, Y, R, D, X = "\033[32m", "\033[33m", "\033[31m", "\033[2m", "\033[0m"
 
@@ -564,17 +565,6 @@ def cmd_selftest(args) -> int:
     return 0
 
 
-def _tree_digest() -> str:
-    import hashlib
-    h = hashlib.sha256()
-    for d in ("orchestrator", "topology", "bin"):
-        for f in sorted(p for p in (ROOT / d).rglob("*")
-                        if p.is_file() and "__pycache__" not in str(p)):
-            h.update(str(f.relative_to(ROOT)).encode())
-            h.update(f.read_bytes())
-    return h.hexdigest()
-
-
 def cmd_version(args) -> int:
     """Is this host running the code you think it is?"""
     marker = ROOT / ".version"
@@ -586,7 +576,7 @@ def cmd_version(args) -> int:
                 recorded = val
             elif key == "installed":
                 installed = val
-    live = _tree_digest()
+    live = tree_digest(ROOT)
     print(f"path      {ROOT}")
     print(f"installed {installed}")
     print(f"digest    {live[:16]}")
